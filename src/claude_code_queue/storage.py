@@ -196,7 +196,10 @@ class QueueStorage:
         for file_path in self.queue_dir.glob("*.executing.md"):
             prompt = self.parser.parse_prompt_file(file_path)
             if prompt:
-                prompt.status = PromptStatus.EXECUTING
+                # Reset to QUEUED: if an .executing.md file exists at load time,
+                # the previous process was killed mid-execution without cleanup.
+                # Re-queue so the task is retried rather than orphaned forever.
+                prompt.status = PromptStatus.QUEUED
                 prompts.append(prompt)
                 processed_ids.add(prompt.id)
 
