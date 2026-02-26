@@ -254,6 +254,7 @@ class QueueStorage:
                 self._remove_prompt_files(prompt.id, self.queue_dir)
             else:  # QUEUED
                 target_dir = self.queue_dir
+                self._remove_prompt_files(prompt.id, self.queue_dir)
             file_path = target_dir / base_filename
             return self.parser.write_prompt_file(prompt, file_path)
         except Exception as e:
