@@ -272,7 +272,11 @@ class SessionStats:
     @property
     def total_input_tokens(self) -> int:
         """Total tokens billed as input (non-cached + cache-write + cache-read)."""
-        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+        return (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
 
 
 @dataclass

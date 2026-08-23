@@ -164,6 +164,10 @@ claude-queue start
 claude-queue start --verbose
 ```
 
+After each execution, the queue displays its duration. It also displays input and output tokens when the Claude session log contains usage data.
+
+Input totals include non-cached, cache-write, and cache-read tokens. The completed prompt file keeps the detailed breakdown in its execution log.
+
 ## Prompt Bank (Template Management)
 
 The Prompt Bank allows you to save and reuse templates for recurring tasks like daily documentation updates, weekly reports, or standard maintenance tasks.

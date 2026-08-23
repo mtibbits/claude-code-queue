@@ -338,10 +338,7 @@ class QueueManager:
         """Process the result of prompt execution."""
         execution_summary = f"Execution completed in {result.execution_time:.1f}s"
 
-        # Extract token usage from the JSONL conversation log BEFORE any branch
-        # logic runs.  CRITICAL: this must happen before _cleanup_rate_limit_artifacts()
-        # which deletes the JSONL file on the rate-limited path.
-        stats = self._extract_session_stats(prompt)
+        stats = self._extract_session_stats(prompt, result.session_id)
 
         if result.success:
             # retry_not_before is already None — cleared by _execute_prompt() via clear_retry_backoff().
@@ -352,10 +349,7 @@ class QueueManager:
             self._log_session_stats(prompt, stats)
 
             self.state.total_processed += 1
-            print(
-                f"✓ Prompt {prompt.id} completed successfully "
-                f"in {result.execution_time:.0f}s"
-            )
+            print(f"✓ Prompt {prompt.id} completed successfully")
             if result.output:
                 summary = result.output.strip()
                 if len(summary) > 1200:
@@ -377,6 +371,8 @@ class QueueManager:
             print(
                 f"✗ Prompt {prompt.id} failed permanently (non-retryable error, no retry)"
             )
+            self._log_session_stats(prompt, stats)
+            print(self._format_stats_line(result.execution_time, stats))
 
         elif result.is_rate_limited:
             # Fix S4: prompt.status is EXECUTING at this point — checking it against
@@ -557,79 +553,89 @@ class QueueManager:
                 return f"{hours}h"
             return f"{hours}h {minutes}m"
 
-    def _extract_session_stats(self, prompt: QueuedPrompt) -> Optional[SessionStats]:
-        """Extract token usage from the JSONL conversation log for a just-finished execution.
-
-        Locates the JSONL file using the same path-encoding logic as
-        _do_cleanup_rate_limit_artifacts(), then sums usage across all assistant
-        turns.
-
-        Returns None if the JSONL cannot be found or parsed.
-        Best-effort: failures are logged but never propagate.
-
-        IMPORTANT: This method relies on Claude Code's internal file layout under
-        ~/.claude/projects/. See _do_cleanup_rate_limit_artifacts() for the same
-        caveat about undocumented internal structure.
-        """
-        if not prompt.last_executed:
+    def _extract_session_stats(
+        self, prompt: QueuedPrompt, session_id: Optional[str]
+    ) -> Optional[SessionStats]:
+        """Return token usage for this execution's exact Claude session."""
+        if session_id is None:
             return None
 
         try:
-            return self._do_extract_session_stats(prompt)
+            return self._do_extract_session_stats(session_id)
         except Exception as e:
             prompt.add_log(f"Warning: session stats extraction failed: {e}")
             return None
 
-    def _do_extract_session_stats(self, prompt: QueuedPrompt) -> Optional[SessionStats]:
-        """Inner implementation — may raise; caller catches all exceptions."""
-        cutoff = prompt.last_executed.timestamp()
-        claude_dir = Path.home() / ".claude"
+    @staticmethod
+    def _do_extract_session_stats(session_id: str) -> Optional[SessionStats]:
+        """Read usage from one canonical session in the active Claude profile."""
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return None
+        except (ValueError, AttributeError):
+            return None
 
-        resolved = prompt._resolved_working_directory or str(
-            Path(prompt.working_directory).resolve()
+        matches = list(claude_config_dir().glob(f"projects/*/{session_id}.jsonl"))
+        if not matches:
+            return None
+
+        session_file = max(matches, key=lambda path: path.stat().st_mtime)
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
         )
-        encoded = resolved.replace("/", "-")
-        jsonl_dir = claude_dir / "projects" / encoded
-
-        if not jsonl_dir.is_dir():
-            return None
-
-        # Find the newest .jsonl file with mtime >= cutoff (no size cap).
-        best_file = None
-        best_mtime = 0.0
-        for f in jsonl_dir.glob("*.jsonl"):
-            try:
-                st = f.stat()
-                if st.st_mtime >= cutoff and st.st_mtime > best_mtime:
-                    best_mtime = st.st_mtime
-                    best_file = f
-            except OSError:
-                pass
-
-        if best_file is None:
-            return None
-
-        # Sum usage across all assistant turns, line-by-line.
-        stats = SessionStats()
-        with open(best_file, "r") as fh:
+        usage_by_message: Dict[str, Dict[str, int]] = {}
+        with open(session_file, "r", encoding="utf-8") as fh:
             for line in fh:
                 try:
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if obj.get("type") != "assistant" or "message" not in obj:
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
                     continue
-                usage = obj["message"].get("usage", {})
-                stats.input_tokens += usage.get("input_tokens", 0)
-                stats.output_tokens += usage.get("output_tokens", 0)
-                stats.cache_creation_input_tokens += usage.get("cache_creation_input_tokens", 0)
-                stats.cache_read_input_tokens += usage.get("cache_read_input_tokens", 0)
-                stats.api_turns += 1
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                message_id = message.get("id")
+                usage = message.get("usage")
+                if not isinstance(message_id, str) or not message_id:
+                    continue
+                if not isinstance(usage, dict):
+                    continue
+                values = {field: usage.get(field, 0) for field in fields}
+                if any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in values.values()
+                ):
+                    continue
 
-        if stats.api_turns == 0:
+                prior = usage_by_message.setdefault(
+                    message_id, {field: 0 for field in fields}
+                )
+                # Claude can repeat one API message for thinking and text events.
+                # Counters repeat or grow, so keep each field's final high-water mark.
+                for field, value in values.items():
+                    prior[field] = max(prior[field], value)
+
+        if not usage_by_message:
             return None
 
-        return stats
+        return SessionStats(
+            input_tokens=sum(item["input_tokens"] for item in usage_by_message.values()),
+            output_tokens=sum(item["output_tokens"] for item in usage_by_message.values()),
+            cache_creation_input_tokens=sum(
+                item["cache_creation_input_tokens"]
+                for item in usage_by_message.values()
+            ),
+            cache_read_input_tokens=sum(
+                item["cache_read_input_tokens"] for item in usage_by_message.values()
+            ),
+            api_turns=len(usage_by_message),
+        )
 
     def _format_stats_line(
         self, execution_time: float, stats: Optional[SessionStats]
