@@ -8,6 +8,7 @@ description: >
   automatically with retry. Triggers on: "queue this", "add to queue",
   "run later", "rate limit", "prompt bank", "save as template",
   "batch of tasks", "claude-queue".
+allowed-tools: [Bash, Read, Glob]
 argument-hint: "[task description or subcommand]"
 disable-model-invocation: false
 ---
@@ -36,7 +37,7 @@ Want me to queue it with `claude-queue` so it retries automatically?"
 claude-queue add "Fix the auth bug" --priority 1 --working-dir /path/to/project
 
 # Create a detailed template file (complex prompts with context)
-claude-queue template task-name --priority 2
+claude-queue template a1b2c3d4-task-name --priority 2
 
 # Check queue
 claude-queue status --detailed
@@ -51,7 +52,8 @@ claude-queue cancel <prompt-id>
 
 ## Prompt Template Format
 
-Template files live at `~/.claude-queue/queue/task-name.md`:
+Active queue files live at
+`~/.claude-queue/queue/a1b2c3d4-task-name.md`:
 
 ```markdown
 ---
@@ -78,14 +80,19 @@ Background, constraints, or requirements.
 What should be delivered when done.
 ```
 
-### Filename Convention
+### Filename convention
 
-Template filenames **must** start with a unique alphanumeric prefix
-(the prompt ID), followed by a `-` and a descriptive name. The prompt
-ID is everything before the first `-` in the filename.
+Each active queue filename must start with a unique ID. Add a `-` and a
+descriptive name after the ID. The queue reads everything before the first
+`-` as the prompt ID.
 
-When creating batches of jobs, use zero-padded numeric prefixes that
-match the `priority` field so that `ls` order equals execution order:
+`claude-queue add`, `bank use`, and `batch generate` create an eight-character
+hexadecimal ID. If you create an active queue file directly or use
+`claude-queue template`, supply a unique ID in the filename.
+
+For a batch of active queue files that you write by hand, you can use unique,
+zero-padded numeric IDs that match the `priority` field. The file order from
+`ls` then matches the queue's priority order:
 
 ```
 0001-Fix-auth-bug.md          # priority: 1, runs first
@@ -93,13 +100,14 @@ match the `priority` field so that `ls` order equals execution order:
 0003-Update-tests.md          # priority: 3, runs third
 ```
 
-Use 4-digit padding for batches under 10,000 jobs.
+Use enough padding for the largest priority. Four digits cover priorities from
+`0` through `9999`.
 
 ### Frontmatter Fields
 
 | Field | Notes |
 |---|---|
-| `priority` | Lower number executes first (0 = highest). For batches, match to the filename prefix. |
+| `priority` | Lower number executes first (`0` is highest). For a hand-written ordered batch, you can match this value to the numeric filename ID. |
 | `working_directory` | Absolute path. Use the actual project path from context. |
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
@@ -125,9 +133,9 @@ Use 4-digit padding for batches under 10,000 jobs.
 - The user will want to review or edit before running
 
 For template files: construct the content and either run
-`claude-queue template task-name` and show the user what to paste in, or
+`claude-queue template a1b2c3d4-task-name` and show the user what to paste in, or
 write the YAML+markdown content directly and tell the user to save it to
-`~/.claude-queue/queue/task-name.md`.
+`~/.claude-queue/queue/a1b2c3d4-task-name.md`.
 
 ## Template Bank (Reusable Templates)
 
@@ -194,14 +202,14 @@ reruns on restart. Prompt users to design queued tasks to be idempotent
 **Always suggest** running `claude-queue status --detailed` before starting
 the daemon so the user can review what will execute.
 
-## Recommended Shell Aliases
+## Recommended shell aliases
 
-Add these to `~/.bashrc` or `~/.zshrc` for convenient queue monitoring:
+If `watch` is installed, add these aliases to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-# Watch the queue directory (see jobs arrive, execute, and disappear)
-alias wQueue='pushd $HOME/.claude-queue/queue; watch ls'
-
-# Watch queue daemon state (current job, retry status, etc.)
-alias wqStat='watch cat $HOME/.claude-queue/queue-state.json'
+alias wQueue='watch ls "$HOME/.claude-queue/queue"'
+alias wqStat='watch claude-queue status --detailed'
 ```
+
+`wQueue` shows files as the daemon moves them. `wqStat` shows queue status,
+including the current jobs and their retry counts.
