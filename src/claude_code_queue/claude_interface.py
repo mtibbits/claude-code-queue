@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
-from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
+from .models import ExecutionResult, RateLimitInfo, QueuedPrompt, parse_optional_model
 from .paths import claude_config_dir
 
 
@@ -297,6 +297,7 @@ class ClaudeCodeInterface:
     def execute_prompt(self, prompt: QueuedPrompt) -> ExecutionResult:
         """Execute a prompt via Claude Code CLI."""
         start_time = time.time()
+        _was_interrupted = False
 
         # Generated up front so a rate-limited run can be correlated to the exact
         # artifact files it created (see QueueManager._do_cleanup_rate_limit_artifacts).
@@ -348,6 +349,9 @@ class ClaudeCodeInterface:
                 if context_refs:
                     full_prompt = f"{' '.join(context_refs)} {prompt.content}"
 
+            if prompt.model is not None:
+                cmd.extend(["--model", parse_optional_model(prompt.model)])
+
             cmd.append(full_prompt)
 
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
@@ -357,9 +361,6 @@ class ClaudeCodeInterface:
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
             subprocess_env = _claude_subprocess_env()
-
-            # Captures the interrupt flag across all exit paths — see finally block.
-            _was_interrupted = False
 
             proc = subprocess.Popen(
                 cmd,
