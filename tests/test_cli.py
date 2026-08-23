@@ -13,6 +13,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -1204,14 +1205,14 @@ class TestBatchVariables:
         assert code == 0
 
 
-# ===========================================================================
-# Cleanup Command
-# ===========================================================================
-
 class TestCleanup:
     """Tests for `claude-queue cleanup [--dry-run]`."""
 
-    def _make_artifacts(self, tmp_path, session_uuid="aaa-bbb-ccc"):
+    def _make_artifacts(
+        self,
+        tmp_path,
+        session_uuid="00134021-1e30-4928-b9af-e92a676ab248",
+    ):
         """Create fake rate-limit artifacts under tmp_path/.claude/."""
         claude_dir = tmp_path / ".claude"
         debug_dir = claude_dir / "debug"
@@ -1221,19 +1222,17 @@ class TestCleanup:
         for d in (debug_dir, projects_dir, todos_dir, telemetry_dir):
             d.mkdir(parents=True)
 
-        # Debug file with rate_limit_error content
         debug_file = debug_dir / f"{session_uuid}.txt"
-        debug_file.write_text("startup\nrate_limit_error\n")
+        debug_file.write_text(
+            'Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}\n'
+        )
 
-        # Correlated JSONL
         jsonl_file = projects_dir / f"{session_uuid}.jsonl"
         jsonl_file.write_bytes(b"x" * 5000)
 
-        # Correlated todo stub
         todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
         todo_file.write_text("[]")
 
-        # Correlated telemetry file
         telemetry_file = telemetry_dir / f"1p_failed_events.{session_uuid}.other-uuid.json"
         telemetry_file.write_text('{"events": []}')
 
@@ -1290,7 +1289,6 @@ class TestCleanup:
     def test_cleanup_preserves_real_todo_file(self, tmp_path, capsys):
         """Todo files > 2 bytes are preserved even if UUID matches a rate-limited session."""
         debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
-        # Overwrite the stub with realistic todo content (> 2 bytes)
         todo_file.write_text('[{"task": "implement feature", "status": "in_progress"}]')
 
         with patch("sys.argv", ["claude-queue", "cleanup"]):
@@ -1301,7 +1299,6 @@ class TestCleanup:
         assert todo_file.exists(), "real todo file (> 2 bytes) must be preserved"
         assert not debug_file.exists()
         assert not jsonl_file.exists()
-        # 3 deleted: debug + jsonl + telemetry (todo preserved by size guard)
         assert "Deleted 3" in capsys.readouterr().out
 
     def test_cleanup_handles_empty_claude_dir(self, tmp_path, capsys):
@@ -1314,3 +1311,76 @@ class TestCleanup:
 
         assert code == 0
         assert "Deleted 0" in capsys.readouterr().out
+
+    def test_cleanup_preserves_debug_that_only_mentions_error_type(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        debug_file.write_text("The user asked what rate_limit_error means.\n")
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+        assert todo_file.exists()
+        assert telemetry_file.exists()
+
+    def test_cleanup_ignores_non_uuid_debug_file(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(
+            tmp_path,
+            session_uuid="not-a-session-uuid",
+        )
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+        assert todo_file.exists()
+        assert telemetry_file.exists()
+
+    def test_cleanup_does_not_report_missing_todo_as_error(self, tmp_path, capsys):
+        _, _, todo_file, _ = self._make_artifacts(tmp_path)
+        todo_file.unlink()
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert "Skipped" not in capsys.readouterr().out
+
+    def test_cleanup_keeps_debug_marker_when_correlated_delete_fails(
+        self,
+        tmp_path,
+        mocker,
+    ):
+        debug_file, jsonl_file, _, _ = self._make_artifacts(tmp_path)
+        original_unlink = Path.unlink
+
+        def selective_unlink(path, *args, **kwargs):
+            if path == jsonl_file:
+                raise OSError("permission denied")
+            return original_unlink(path, *args, **kwargs)
+
+        mocker.patch.object(Path, "unlink", selective_unlink)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+
+        mocker.stopall()
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                retry_code = main()
+
+        assert retry_code == 0
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()

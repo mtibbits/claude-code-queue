@@ -8,11 +8,13 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, Set
+from uuid import UUID
 
 from .batch import (
     extract_variables,
@@ -24,6 +26,9 @@ from .batch import (
 from .queue_manager import QueueManager
 from .storage import QueueStorage
 from .models import QueuedPrompt, PromptStatus
+
+
+_RATE_LIMIT_ERROR_TYPE = re.compile(r'"type"\s*:\s*"rate_limit_error"')
 
 
 def main():
@@ -242,7 +247,6 @@ Examples:
         "--force", action="store_true", help="Overwrite existing skill file"
     )
 
-    # Cleanup subcommand
     cleanup_parser = subparsers.add_parser(
         "cleanup", help="Remove rate-limit artifacts from ~/.claude/"
     )
@@ -736,9 +740,9 @@ def cmd_install_skill(args) -> int:
 def cmd_cleanup(args) -> int:
     """Remove rate-limit artifacts from ~/.claude/.
 
-    Primary identification: scan debug transcripts for 'rate_limit_error' in
-    the content (authoritative signal).  Then delete correlated JSONL, todo,
-    and telemetry files by UUID.
+    Identify sessions from canonical-UUID debug transcripts that contain a
+    429 rate_limit_error record. Delete correlated JSONL, todo, and telemetry
+    files before the debug marker so a failed run can retry.
 
     This is the E3 pattern: no claude binary needed.
     """
@@ -746,34 +750,40 @@ def cmd_cleanup(args) -> int:
     dry_run = args.dry_run
     matched = 0
     skipped = 0
-    rate_limited_uuids: List[str] = []
+    rate_limited_sessions: Dict[str, Path] = {}
+    failed_sessions: Set[str] = set()
 
-    # 1. Debug transcripts — primary identification via content grep.
-    #    Read the full file (max ~90 KB for successful runs) since this is a
-    #    one-time tool where correctness matters more than speed.
     debug_dir = claude_dir / "debug"
     if debug_dir.is_dir():
         for debug_file in debug_dir.glob("*.txt"):
             try:
                 with open(debug_file, "r", errors="replace") as fh:
                     content = fh.read()
-                if "rate_limit_error" in content:
-                    rate_limited_uuids.append(debug_file.stem)
-                    if dry_run:
-                        print(f"  [dry-run] would delete {debug_file}")
-                    else:
-                        debug_file.unlink()
-                    matched += 1
             except OSError:
                 skipped += 1
+                continue
 
-    if rate_limited_uuids:
-        print(f"Identified {len(rate_limited_uuids)} rate-limited session(s)")
+            try:
+                session_uuid = str(UUID(debug_file.stem))
+            except ValueError:
+                continue
+            if session_uuid != debug_file.stem:
+                continue
 
-    # 2. JSONL conversation logs — by UUID correlation
+            normalized_content = content.replace(r'\"', '"')
+            has_rate_limit_error = any(
+                "Error: 429" in line and _RATE_LIMIT_ERROR_TYPE.search(line)
+                for line in normalized_content.splitlines()
+            )
+            if has_rate_limit_error:
+                rate_limited_sessions[session_uuid] = debug_file
+
+    if rate_limited_sessions:
+        print(f"Identified {len(rate_limited_sessions)} rate-limited session(s)")
+
     projects_dir = claude_dir / "projects"
     if projects_dir.is_dir():
-        for session_uuid in rate_limited_uuids:
+        for session_uuid in rate_limited_sessions:
             for jsonl_file in projects_dir.glob(f"*/{session_uuid}.jsonl"):
                 try:
                     if dry_run:
@@ -783,11 +793,11 @@ def cmd_cleanup(args) -> int:
                     matched += 1
                 except OSError:
                     skipped += 1
+                    failed_sessions.add(session_uuid)
 
-    # 3. Todo stubs — by UUID correlation + 2-byte size guard
     todos_dir = claude_dir / "todos"
     if todos_dir.is_dir():
-        for session_uuid in rate_limited_uuids:
+        for session_uuid in rate_limited_sessions:
             todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
             try:
                 st = todo_file.stat()
@@ -797,13 +807,15 @@ def cmd_cleanup(args) -> int:
                     else:
                         todo_file.unlink()
                     matched += 1
+            except FileNotFoundError:
+                pass
             except OSError:
                 skipped += 1
+                failed_sessions.add(session_uuid)
 
-    # 4. Telemetry — by UUID correlation
     telemetry_dir = claude_dir / "telemetry"
     if telemetry_dir.is_dir():
-        for session_uuid in rate_limited_uuids:
+        for session_uuid in rate_limited_sessions:
             for f in telemetry_dir.glob(f"1p_failed_events.{session_uuid}.*.json"):
                 try:
                     if dry_run:
@@ -813,12 +825,25 @@ def cmd_cleanup(args) -> int:
                     matched += 1
                 except OSError:
                     skipped += 1
+                    failed_sessions.add(session_uuid)
+
+    for session_uuid, debug_file in rate_limited_sessions.items():
+        if session_uuid in failed_sessions:
+            continue
+        try:
+            if dry_run:
+                print(f"  [dry-run] would delete {debug_file}")
+            else:
+                debug_file.unlink()
+            matched += 1
+        except OSError:
+            skipped += 1
 
     action = "Would delete" if dry_run else "Deleted"
     print(f"{action} {matched} rate-limit artifact(s)")
     if skipped:
         print(f"Skipped {skipped} file(s) due to errors")
-    return 0
+    return 1 if skipped else 0
 
 
 def cmd_prompt_box(args) -> int:
