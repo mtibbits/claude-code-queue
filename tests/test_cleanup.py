@@ -22,13 +22,9 @@ from claude_code_queue.models import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 SESSION_UUID = "00134021-1e30-4928-b9af-e92a676ab248"
 OTHER_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-FAKE_WORKING_DIR = "/home/testuser/project"
+FAKE_WORKING_DIR = str(Path("/home/testuser/project").resolve())
 
 
 def _make_claude_dirs(tmp_path, working_dir=FAKE_WORKING_DIR):
@@ -81,11 +77,6 @@ def _rate_limit_result() -> ExecutionResult:
         rate_limit_info=RateLimitInfo(is_rate_limited=True, reset_time=None),
         execution_time=0.1,
     )
-
-
-# ===========================================================================
-# Basic Cleanup — All Four Artifact Types  (CLN-001 through CLN-004)
-# ===========================================================================
 
 
 def test_cleanup_deletes_rate_limited_jsonl(tmp_path, manager):  # CLN-001
@@ -156,18 +147,12 @@ def test_cleanup_deletes_correlated_telemetry_file(tmp_path, manager):  # CLN-00
     assert not telemetry_file.exists(), "Correlated telemetry file should be deleted"
 
 
-# ===========================================================================
-# Preservation — Files That Must NOT Be Deleted  (CLN-005 through CLN-009)
-# ===========================================================================
-
-
 def test_cleanup_preserves_old_jsonl(tmp_path, manager):  # CLN-005
     """JSONL files older than last_executed are not deleted."""
     claude_dir, jsonl_dir, *_ = _make_claude_dirs(tmp_path)
 
     old_jsonl = jsonl_dir / f"{SESSION_UUID}.jsonl"
     _write_file(old_jsonl, size_bytes=4000)
-    # Set mtime to 1 hour ago
     old_time = time.time() - 3600
     os.utime(old_jsonl, (old_time, old_time))
 
@@ -218,10 +203,8 @@ def test_cleanup_preserves_old_debug_file(tmp_path, manager):  # CLN-008
     """Debug files older than last_executed are not deleted even with UUID match."""
     claude_dir, jsonl_dir, _, debug_dir, _ = _make_claude_dirs(tmp_path)
 
-    # Create JSONL file with current timestamp
     _write_file(jsonl_dir / f"{SESSION_UUID}.jsonl", size_bytes=4000)
 
-    # Create debug file with old timestamp
     debug_file = debug_dir / f"{SESSION_UUID}.txt"
     _write_file(debug_file, size_bytes=13000)
     old_time = time.time() - 3600
@@ -245,10 +228,8 @@ def test_cleanup_does_not_delete_debug_without_jsonl_match(tmp_path, manager):  
     claude_dir, jsonl_dir, _, debug_dir, _ = _make_claude_dirs(tmp_path)
     prompt = _make_prompt()
 
-    # JSONL file is large (successful run) — no UUID collected
     _write_file(jsonl_dir / f"{SESSION_UUID}.jsonl", size_bytes=150_000)
 
-    # Debug file exists for same UUID — must NOT be deleted
     debug_file = debug_dir / f"{SESSION_UUID}.txt"
     _write_file(debug_file, size_bytes=13000)
 
@@ -258,11 +239,6 @@ def test_cleanup_does_not_delete_debug_without_jsonl_match(tmp_path, manager):  
         manager._cleanup_rate_limit_artifacts(prompt)
 
     assert debug_file.exists(), "Debug file must not be deleted without JSONL UUID match"
-
-
-# ===========================================================================
-# Cleanup Not Triggered for Other Result Types  (CLN-010, CLN-011)
-# ===========================================================================
 
 
 def test_cleanup_not_called_on_success(tmp_path, manager, mocker):  # CLN-010
@@ -311,49 +287,35 @@ def test_cleanup_called_on_rate_limit(tmp_path, manager, mocker):  # CLN-012
     spy.assert_called_once_with(prompt)
 
 
-# ===========================================================================
-# Missing Directories  (CLN-013)
-# ===========================================================================
-
-
 def test_cleanup_handles_missing_directories(tmp_path, manager):  # CLN-013
     """Cleanup does not crash when artifact directories don't exist."""
-    # Point home at tmp_path which has no .claude/ at all
     prompt = _make_prompt()
     prompt.last_executed = datetime.now()
 
     with patch("pathlib.Path.home", return_value=tmp_path):
         manager.state = QueueState()
         manager.state.add_prompt(prompt)
-        # Should not raise
         manager._cleanup_rate_limit_artifacts(prompt)
 
-    # No log entry since nothing was deleted
     assert "Cleaned up" not in prompt.execution_log
 
 
-# ===========================================================================
-# Per-File Exception Handling  (CLN-014)
-# ===========================================================================
-
-
 def test_cleanup_continues_after_oserror_on_one_file(tmp_path, manager, mocker):  # CLN-014
-    """If stat() raises OSError on the debug file, the todo file is still deleted."""
-    _, jsonl_dir, todos_dir, debug_dir, _ = _make_claude_dirs(tmp_path)
+    """If debug stat() raises OSError, later telemetry cleanup still runs."""
+    _, jsonl_dir, todos_dir, debug_dir, telemetry_dir = _make_claude_dirs(tmp_path)
     prompt = _make_prompt()
 
-    # Create one small JSONL
     _write_file(jsonl_dir / f"{SESSION_UUID}.jsonl", size_bytes=4000)
 
-    # Create debug file normally
     debug_file = debug_dir / f"{SESSION_UUID}.txt"
     _write_file(debug_file, size_bytes=13000)
 
-    # Create todo stub — should still be cleaned up despite debug failure
     todo_file = todos_dir / f"{SESSION_UUID}-agent-{SESSION_UUID}.json"
     _write_file(todo_file, content="[]")
 
-    # Patch Path.stat to raise OSError only for the debug file
+    telemetry_file = telemetry_dir / f"1p_failed_events.{SESSION_UUID}.{OTHER_UUID}.json"
+    _write_file(telemetry_file, size_bytes=30000)
+
     original_stat = Path.stat
 
     def selective_stat(self, *args, **kwargs):
@@ -372,22 +334,17 @@ def test_cleanup_continues_after_oserror_on_one_file(tmp_path, manager, mocker):
     mocker.stopall()
     assert not todo_file.exists(), "Todo file should still be deleted despite debug OSError"
     assert debug_file.exists(), "Debug file should survive (stat raised OSError)"
-
-
-# ===========================================================================
-# Top-Level Exception Safety  (CLN-015)
-# ===========================================================================
+    assert not telemetry_file.exists(), "Telemetry cleanup should continue after debug OSError"
 
 
 def test_cleanup_exception_does_not_break_result_processing(tmp_path, manager, mocker):  # CLN-015
     """If the entire cleanup throws, _process_execution_result() still completes
-    and the prompt's RATE_LIMITED status is persisted.
+    the prompt's RATE_LIMITED transition and final accounting.
     """
     prompt = QueuedPrompt(content="task", max_retries=3)
     manager.state = QueueState()
     manager.state.add_prompt(prompt)
 
-    # Make cleanup explode
     mocker.patch.object(
         manager, "_do_cleanup_rate_limit_artifacts",
         side_effect=RuntimeError("disk on fire")
@@ -407,11 +364,6 @@ def test_cleanup_exception_does_not_break_result_processing(tmp_path, manager, m
     assert "artifact cleanup failed" in prompt.execution_log
 
 
-# ===========================================================================
-# No last_executed Guard  (CLN-016)
-# ===========================================================================
-
-
 def test_cleanup_noop_without_last_executed(manager):  # CLN-016
     """Cleanup is a no-op when prompt.last_executed is None."""
     prompt = QueuedPrompt(content="task")
@@ -420,14 +372,8 @@ def test_cleanup_noop_without_last_executed(manager):  # CLN-016
     manager.state = QueueState()
     manager.state.add_prompt(prompt)
 
-    # Should not raise and should not log
     manager._cleanup_rate_limit_artifacts(prompt)
     assert "Cleaned up" not in prompt.execution_log
-
-
-# ===========================================================================
-# Resolved Working Directory  (CLN-017, CLN-018)
-# ===========================================================================
 
 
 def test_execute_prompt_stashes_resolved_working_directory(manager, mocker):  # CLN-017
@@ -448,7 +394,6 @@ def test_execute_prompt_stashes_resolved_working_directory(manager, mocker):  # 
 
 def test_cleanup_uses_resolved_working_directory(tmp_path, manager):  # CLN-018
     """Cleanup uses _resolved_working_directory (not re-resolving working_directory)."""
-    # Set up dirs for the resolved path, not the relative one
     claude_dir, jsonl_dir, *_ = _make_claude_dirs(tmp_path, working_dir=FAKE_WORKING_DIR)
 
     prompt = QueuedPrompt(
@@ -470,11 +415,6 @@ def test_cleanup_uses_resolved_working_directory(tmp_path, manager):  # CLN-018
     assert not jsonl_file.exists(), (
         "Cleanup must use _resolved_working_directory, not re-resolve '.'"
     )
-
-
-# ===========================================================================
-# Deleted Count and Logging  (CLN-019)
-# ===========================================================================
 
 
 def test_cleanup_counts_all_deleted_artifacts(tmp_path, manager, capsys):  # CLN-019
@@ -512,11 +452,6 @@ def test_cleanup_no_log_when_nothing_deleted(tmp_path, manager, capsys):  # CLN-
     assert "[cleanup]" not in captured.out
 
 
-# ===========================================================================
-# JSONL Early Break  (CLN-021)
-# ===========================================================================
-
-
 def test_cleanup_breaks_after_first_jsonl_match(tmp_path, manager):  # CLN-021
     """Only one JSONL file is deleted per cleanup (one subprocess = one UUID).
 
@@ -543,11 +478,6 @@ def test_cleanup_breaks_after_first_jsonl_match(tmp_path, manager):  # CLN-021
     )
 
 
-# ===========================================================================
-# _resolved_working_directory Field  (CLN-022)
-# ===========================================================================
-
-
 def test_resolved_working_directory_not_persisted_to_yaml(tmp_path, manager):  # CLN-022
     """_resolved_working_directory is transient and not written to YAML frontmatter."""
     prompt = QueuedPrompt(content="task", working_directory="/some/path")
@@ -558,21 +488,14 @@ def test_resolved_working_directory_not_persisted_to_yaml(tmp_path, manager):  #
     manager.state.add_prompt(prompt)
     manager.storage.save_queue_state(manager.state)
 
-    # Read the file back and check YAML doesn't contain the field
     queue_files = list(manager.storage.queue_dir.glob("*.md"))
     assert len(queue_files) == 1
     content = queue_files[0].read_text()
     assert "_resolved_working_directory" not in content
 
-    # Reload and verify it's None (not persisted)
     reloaded = manager.storage.load_queue_state()
     reloaded_prompt = reloaded.prompts[0]
     assert reloaded_prompt._resolved_working_directory is None
-
-
-# ===========================================================================
-# Fallback When _resolved_working_directory Is None  (CLN-023)
-# ===========================================================================
 
 
 def test_cleanup_falls_back_to_resolve_when_stash_missing(tmp_path, manager):  # CLN-023
