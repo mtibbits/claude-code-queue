@@ -96,6 +96,14 @@ path only.
   entries. Nothing outside these session-scoped names is touched. Failures are
   logged and swallowed so `save_queue_state()` always runs.
 
+### Session Usage Statistics
+After each execution, the queue prints the duration and reads token usage from
+the exact session JSONL file. `ExecutionResult.session_id` selects the file in
+the active `$CLAUDE_CONFIG_DIR` profile. The parser counts each assistant message
+ID once because Claude can store several events for one API response. It adds
+non-cached, cache-write, and cache-read tokens for the displayed input total.
+The prompt execution log keeps the detailed breakdown across all result paths.
+
 ### Retry Logic
 - `max_retries` = total attempts (3 = initial + 2 retries; -1 = unlimited)
 - Rate-limit hits and generic failures share the same `retry_count`

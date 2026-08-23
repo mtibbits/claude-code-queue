@@ -2,6 +2,7 @@
 Queue manager with execution loop.
 """
 
+import json
 import os
 import sys
 import time
@@ -10,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
 
-from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult
+from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult, SessionStats
 from .storage import QueueStorage
 from .claude_interface import ClaudeCodeInterface
 from .locking import QueueLock, QueueLockError
@@ -337,23 +338,24 @@ class QueueManager:
         """Process the result of prompt execution."""
         execution_summary = f"Execution completed in {result.execution_time:.1f}s"
 
+        stats = self._extract_session_stats(prompt, result.session_id)
+
         if result.success:
             # retry_not_before is already None — cleared by _execute_prompt() via clear_retry_backoff().
             prompt.status = PromptStatus.COMPLETED
             prompt.add_log(f"{execution_summary} - SUCCESS")
             if result.output:
                 prompt.add_log(f"Output:\n{result.output}")
+            self._log_session_stats(prompt, stats)
 
             self.state.total_processed += 1
-            print(
-                f"✓ Prompt {prompt.id} completed successfully "
-                f"in {result.execution_time:.0f}s"
-            )
+            print(f"✓ Prompt {prompt.id} completed successfully")
             if result.output:
                 summary = result.output.strip()
                 if len(summary) > 1200:
                     summary = summary[:1200].rstrip() + "\n… (truncated)"
                 print(f"--- Output ---\n{summary}\n--- (full output saved to completed/) ---")
+            print(self._format_stats_line(result.execution_time, stats))
 
         elif result.is_non_retryable:
             # Fix B — Non-retryable error: fail immediately, skip retry counter and can_retry().
@@ -369,6 +371,8 @@ class QueueManager:
             print(
                 f"✗ Prompt {prompt.id} failed permanently (non-retryable error, no retry)"
             )
+            self._log_session_stats(prompt, stats)
+            print(self._format_stats_line(result.execution_time, stats))
 
         elif result.is_rate_limited:
             # Fix S4: prompt.status is EXECUTING at this point — checking it against
@@ -396,6 +400,7 @@ class QueueManager:
                     else ""
                 )
                 prompt.add_log(f"Message{source_tag}: {result.rate_limit_info.limit_message}")
+            self._log_session_stats(prompt, stats)
 
             if not was_already_rate_limited and self.state is not None:
                 self.state.rate_limited_count += 1
@@ -406,6 +411,7 @@ class QueueManager:
                 )
             else:
                 print(f"⚠ Prompt {prompt.id} rate limited, will retry in 5 minutes")
+            print(self._format_stats_line(result.execution_time, stats))
 
             self._cleanup_rate_limit_artifacts(prompt, result.session_id)
 
@@ -425,23 +431,27 @@ class QueueManager:
                 )
                 if result.error:
                     prompt.add_log(f"Error: {result.error}")
+                self._log_session_stats(prompt, stats)
                 print(
                     f"✗ Prompt {prompt.id} failed, will retry in "
                     f"{self._generic_failure_retry_delay}s "
                     f"({prompt.retry_count}/{'∞' if prompt.max_retries == -1 else prompt.max_retries})"
                 )
+                print(self._format_stats_line(result.execution_time, stats))
             else:
                 prompt.status = PromptStatus.FAILED
                 prompt.clear_retry_backoff()    # Fix 3: clear stale field for YAML cleanliness
                 prompt.add_log(f"{execution_summary} - FAILED (max retries exceeded)")
                 if result.error:
                     prompt.add_log(f"Error: {result.error}")
+                self._log_session_stats(prompt, stats)
 
                 self.state.failed_count += 1
                 retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
                 print(
                     f"✗ Prompt {prompt.id} failed permanently after {retries_str} attempts"
                 )
+                print(self._format_stats_line(result.execution_time, stats))
 
         self.state.last_processed = datetime.now()
 
@@ -542,6 +552,115 @@ class QueueManager:
             if minutes == 0:
                 return f"{hours}h"
             return f"{hours}h {minutes}m"
+
+    def _extract_session_stats(
+        self, prompt: QueuedPrompt, session_id: Optional[str]
+    ) -> Optional[SessionStats]:
+        """Return token usage for this execution's exact Claude session."""
+        if session_id is None:
+            return None
+
+        try:
+            return self._do_extract_session_stats(session_id)
+        except Exception as e:
+            prompt.add_log(f"Warning: session stats extraction failed: {e}")
+            return None
+
+    @staticmethod
+    def _do_extract_session_stats(session_id: str) -> Optional[SessionStats]:
+        """Read usage from one canonical session in the active Claude profile."""
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return None
+        except (ValueError, AttributeError):
+            return None
+
+        matches = list(claude_config_dir().glob(f"projects/*/{session_id}.jsonl"))
+        if not matches:
+            return None
+
+        session_file = max(matches, key=lambda path: path.stat().st_mtime)
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+        usage_by_message: Dict[str, Dict[str, int]] = {}
+        with open(session_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                    continue
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                message_id = message.get("id")
+                usage = message.get("usage")
+                if not isinstance(message_id, str) or not message_id:
+                    continue
+                if not isinstance(usage, dict):
+                    continue
+                values = {field: usage.get(field, 0) for field in fields}
+                if any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in values.values()
+                ):
+                    continue
+
+                prior = usage_by_message.setdefault(
+                    message_id, {field: 0 for field in fields}
+                )
+                # Claude can repeat one API message for thinking and text events.
+                # Counters repeat or grow, so keep each field's final high-water mark.
+                for field, value in values.items():
+                    prior[field] = max(prior[field], value)
+
+        if not usage_by_message:
+            return None
+
+        return SessionStats(
+            input_tokens=sum(item["input_tokens"] for item in usage_by_message.values()),
+            output_tokens=sum(item["output_tokens"] for item in usage_by_message.values()),
+            cache_creation_input_tokens=sum(
+                item["cache_creation_input_tokens"]
+                for item in usage_by_message.values()
+            ),
+            cache_read_input_tokens=sum(
+                item["cache_read_input_tokens"] for item in usage_by_message.values()
+            ),
+            api_turns=len(usage_by_message),
+        )
+
+    def _format_stats_line(
+        self, execution_time: float, stats: Optional[SessionStats]
+    ) -> str:
+        """Format a stats line for console output after job completion."""
+        parts = [f"Duration: {self._format_duration(execution_time)}"]
+        if stats is not None:
+            parts.append(f"Input: {stats.total_input_tokens:,} tokens")
+            parts.append(f"Output: {stats.output_tokens:,} tokens")
+        return "    " + " | ".join(parts)
+
+    def _log_session_stats(
+        self, prompt: QueuedPrompt, stats: Optional[SessionStats]
+    ) -> None:
+        """Log detailed token usage to the prompt's execution log (.md file)."""
+        if stats is None:
+            return
+        prompt.add_log(
+            f"Token usage: {stats.input_tokens:,} input"
+            f" + {stats.cache_creation_input_tokens:,} cache-write"
+            f" + {stats.cache_read_input_tokens:,} cache-read"
+            f" = {stats.total_input_tokens:,} total input,"
+            f" {stats.output_tokens:,} output"
+            f" ({stats.api_turns} API turn{'s' if stats.api_turns != 1 else ''})"
+        )
 
     def add_prompt(self, prompt: QueuedPrompt) -> bool:
         """Add a prompt to the queue."""
