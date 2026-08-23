@@ -1349,6 +1349,34 @@ class TestCleanup:
         out = capsys.readouterr().out
         assert "Deleted 4 rate-limit artifact(s)" in out
 
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "Error: 429",
+            "Error: Error: 429",
+            "Error in non-streaming fallback: 429",
+        ],
+    )
+    def test_cleanup_matches_known_claude_429_prefixes(
+        self, tmp_path, capsys, prefix
+    ):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        debug_file.write_text(
+            f"2026-07-08T05:20:35.896Z [ERROR] {prefix} "
+            '{"type":"error","error":{"type":"rate_limit_error"}}\n'
+        )
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert not any(
+            path.exists()
+            for path in (debug_file, jsonl_file, todo_file, telemetry_file)
+        )
+        assert "Deleted 4 rate-limit artifact(s)" in capsys.readouterr().out
+
     def test_cleanup_preserves_non_rate_limited_debug(self, tmp_path, capsys):
         """Debug files without rate_limit_error are not deleted."""
         claude_dir = tmp_path / ".claude"

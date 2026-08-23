@@ -28,7 +28,11 @@ from .models import QueuedPrompt, PromptStatus, parse_optional_model
 from .paths import claude_config_dir
 
 
-_RATE_LIMIT_PREFIX = "Error: 429"
+_RATE_LIMIT_PREFIXES = (
+    "Error: 429",
+    "Error: Error: 429",
+    "Error in non-streaming fallback: 429",
+)
 
 
 def _is_rate_limit_error_record(line: str) -> bool:
@@ -42,11 +46,15 @@ def _is_rate_limit_error_record(line: str) -> bool:
     except ValueError:
         return False
 
-    if not record.startswith(_RATE_LIMIT_PREFIX):
+    prefix = next(
+        (candidate for candidate in _RATE_LIMIT_PREFIXES if record.startswith(candidate)),
+        None,
+    )
+    if prefix is None:
         return False
 
     try:
-        payload = json.loads(record[len(_RATE_LIMIT_PREFIX):].strip())
+        payload = json.loads(record[len(prefix):].strip())
     except json.JSONDecodeError:
         return False
 
