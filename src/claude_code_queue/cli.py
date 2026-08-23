@@ -22,7 +22,7 @@ from .batch import (
 )
 from .queue_manager import QueueManager
 from .storage import QueueStorage
-from .models import QueuedPrompt, PromptStatus
+from .models import QueuedPrompt, PromptStatus, parse_optional_model
 
 
 def main():
@@ -140,7 +140,11 @@ Examples:
         "--estimated-tokens", "-t", type=int, help="Estimated token usage"
     )
     add_parser.add_argument(
-        "--model", "-m", default=None, help="Claude model ID (e.g. claude-haiku-4-5-20251001)"
+        "--model",
+        "-m",
+        type=parse_optional_model,
+        default=None,
+        help="Claude model ID (e.g. claude-haiku-4-5-20251001)",
     )
 
     template_parser = subparsers.add_parser(
@@ -399,6 +403,8 @@ def cmd_status(args) -> int:
             print(
                 f"   {prompt.content[:80]}{'...' if len(prompt.content) > 80 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             if prompt.retry_count > 0:
                 print(f"   Retries: {prompt.retry_count}/{prompt.max_retries}")
 
@@ -448,6 +454,7 @@ def cmd_list(args) -> int:
                     "status": prompt.status.value,
                     "priority": prompt.priority,
                     "working_directory": prompt.working_directory,
+                    "model": prompt.model,
                     "created_at": prompt.created_at.isoformat(),
                     "retry_count": prompt.retry_count,
                     "max_retries": prompt.max_retries,
@@ -477,6 +484,8 @@ def cmd_list(args) -> int:
             print(
                 f"   {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             print(f"   Created: {prompt.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
     return 0

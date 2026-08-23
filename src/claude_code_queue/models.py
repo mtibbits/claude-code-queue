@@ -9,6 +9,18 @@ from typing import List, Optional, Dict, Any
 import uuid
 
 
+def parse_optional_model(value: Any) -> Optional[str]:
+    """Return a valid optional Claude model ID."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("model must be a non-empty string or null")
+    model = value.strip()
+    if not model:
+        raise ValueError("model must be a non-empty string or null")
+    return model
+
+
 class PromptStatus(Enum):
     """Status of a queued prompt."""
 

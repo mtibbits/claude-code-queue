@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 import yaml  # type: ignore
 
-from .models import QueuedPrompt, QueueState, PromptStatus
+from .models import QueuedPrompt, QueueState, PromptStatus, parse_optional_model
 
 
 class MarkdownPromptParser:
@@ -107,11 +107,6 @@ class MarkdownPromptParser:
             except (ValueError, TypeError):
                 retry_count = 0
 
-            # R7 — Type-safe coercion for model. YAML parses `model: true` as bool and
-            # `model: 42` as int; subprocess.Popen requires all cmd elements to be str.
-            _raw_model = metadata.get("model")
-            _model = str(_raw_model) if _raw_model is not None else None
-
             prompt = QueuedPrompt(
                 id=prompt_id,
                 content=prompt_content,
@@ -122,7 +117,7 @@ class MarkdownPromptParser:
                 max_retries=metadata.get("max_retries", 3),
                 retry_count=retry_count,
                 estimated_tokens=metadata.get("estimated_tokens"),
-                model=_model,
+                model=parse_optional_model(metadata.get("model")),
                 # R5 — Restore created_at from YAML; fall back to filesystem ctime.
                 # Using ctime alone causes created_at to drift when files are copied or
                 # their timestamps change. The YAML value is the authoritative source.
@@ -594,7 +589,7 @@ What should be delivered...
                     'priority': metadata.get('priority', 0),
                     'working_directory': metadata.get('working_directory', '.'),
                     'estimated_tokens': metadata.get('estimated_tokens'),
-                    'model': metadata.get('model'),
+                    'model': parse_optional_model(metadata.get('model')),
                     'modified': datetime.fromtimestamp(file_path.stat().st_mtime)
                 })
 

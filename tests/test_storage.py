@@ -414,32 +414,31 @@ def test_parse_model_null(tmp_path):  # STO-066
     assert prompt.model is None
 
 
-def test_parse_model_coerces_bool_to_string(tmp_path):  # STO-067
-    """model: true in YAML → str coercion → prompt.model == 'True' (R7)."""
+@pytest.mark.parametrize("value", ["true", "42", "[]", "{}", "''"])
+def test_parse_model_rejects_invalid_yaml_values(tmp_path, value):  # STO-067
+    """Invalid YAML model values do not create executable prompts."""
     storage = QueueStorage(str(tmp_path))
     file_path = storage.queue_dir / "abc12345-task.md"
     file_path.write_text(
         "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
-        "model: true\n"
+        f"model: {value}\n"
         "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
     )
     prompt = storage.parser.parse_prompt_file(file_path)
-    assert prompt is not None
-    assert prompt.model == "True"
+    assert prompt is None
 
 
-def test_parse_model_coerces_int_to_string(tmp_path):  # STO-068
-    """model: 42 in YAML → str coercion → prompt.model == '42' (R7)."""
+def test_parse_model_trims_string(tmp_path):  # STO-068
     storage = QueueStorage(str(tmp_path))
     file_path = storage.queue_dir / "abc12345-task.md"
     file_path.write_text(
         "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
-        "model: 42\n"
+        "model: '  sonnet  '\n"
         "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
     )
     prompt = storage.parser.parse_prompt_file(file_path)
     assert prompt is not None
-    assert prompt.model == "42"
+    assert prompt.model == "sonnet"
 
 
 def test_model_roundtrip_write_then_parse(tmp_path):  # STO-069
@@ -487,6 +486,14 @@ def test_bank_list_includes_model_key(tmp_path):  # STO-073
     templates = storage.list_bank_templates()
     assert len(templates) == 1
     assert "model" in templates[0]
+
+
+def test_bank_list_skips_template_with_invalid_model(tmp_path):
+    storage = QueueStorage(str(tmp_path))
+    (storage.bank_dir / "invalid.md").write_text(
+        "---\nmodel: true\n---\n\nInvalid model"
+    )
+    assert storage.list_bank_templates() == []
 
 
 def test_parse_defaults_when_keys_missing(tmp_path):  # STO-024
@@ -919,6 +926,16 @@ def test_bank_use_preserves_max_retries_from_template(tmp_path):  # STO-059
     prompt = storage.use_bank_template("retry-test")
     assert prompt is not None
     assert prompt.max_retries == 5
+
+
+def test_bank_use_preserves_model_from_template(tmp_path):
+    storage = QueueStorage(str(tmp_path))
+    (storage.bank_dir / "model-test.md").write_text(
+        "---\npriority: 0\nmodel: claude-sonnet-4-6\n---\n\nContent"
+    )
+    prompt = storage.use_bank_template("model-test")
+    assert prompt is not None
+    assert prompt.model == "claude-sonnet-4-6"
 
 
 def test_bank_delete_removes_template(tmp_path):  # STO-060

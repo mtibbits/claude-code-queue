@@ -13,6 +13,7 @@ from claude_code_queue.models import (
     QueuedPrompt,
     QueueState,
     RateLimitInfo,
+    parse_optional_model,
 )
 
 
@@ -64,6 +65,20 @@ def test_prompt_model_accepts_string():  # MOD-030
     """model field stores an arbitrary string model ID."""
     p = QueuedPrompt(content="test", model="claude-haiku-4-5-20251001")
     assert p.model == "claude-haiku-4-5-20251001"
+
+
+@pytest.mark.parametrize("value", [True, 42, [], {}, "", "   "])
+def test_parse_optional_model_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="non-empty string or null"):
+        parse_optional_model(value)
+
+
+def test_parse_optional_model_trims_value():
+    assert parse_optional_model("  sonnet  ") == "sonnet"
+
+
+def test_parse_optional_model_accepts_none():
+    assert parse_optional_model(None) is None
 
 
 # ===========================================================================
