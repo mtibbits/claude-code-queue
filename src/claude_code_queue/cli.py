@@ -23,6 +23,7 @@ from .batch import (
 from .queue_manager import QueueManager
 from .storage import QueueStorage
 from .models import QueuedPrompt, PromptStatus, parse_optional_model
+from .paths import claude_config_dir
 
 
 def main():
@@ -242,7 +243,8 @@ Examples:
 
     # Install skill subcommand
     install_skill_parser = subparsers.add_parser(
-        "install-skill", help="Install the Claude Code skill to ~/.claude/skills/"
+        "install-skill",
+        help="Install the Claude Code skill into the active profile's skills/ directory",
     )
     install_skill_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing skill file"
@@ -315,8 +317,8 @@ def cmd_start(args) -> int:
             stats = state.get_stats()
             print(f"Queue status: {stats['status_counts']}")
 
-    manager.start(callback=status_callback if args.verbose else None)
-    return 0
+    started = manager.start(callback=status_callback if args.verbose else None)
+    return 0 if started else 1
 
 
 def cmd_add(args) -> int:
@@ -716,8 +718,12 @@ def cmd_batch_variables(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-    """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
-    dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
+    """Install the Claude Code skill into the active profile's skills/queue/SKILL.md.
+
+    The destination follows $CLAUDE_CONFIG_DIR, so each Claude Code profile gets
+    its own copy rather than every install landing in ~/.claude.
+    """
+    dest = claude_config_dir() / "skills" / "queue" / "SKILL.md"
     skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
 
     if not skill_src.exists():
@@ -787,4 +793,4 @@ def cmd_prompt_box(args) -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
