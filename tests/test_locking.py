@@ -8,6 +8,8 @@ Test IDs: LCK-001..LCK-019
 """
 
 import os
+import select
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -110,20 +112,44 @@ class TestAcquireRelease:
         """The kernel owns the lock, so a SIGKILLed processor leaves nothing to
         clean up by hand. A lock implemented with a plain marker file would strand
         the directory forever."""
+        if not hasattr(signal, "SIGKILL"):
+            pytest.skip("SIGKILL is not available on this platform")
+
         pkg_parent = str(Path(claude_code_queue.__file__).parent.parent)
         source = (
+            "import threading;"
             "from claude_code_queue.locking import QueueLock;"
-            f"QueueLock({str(tmp_path)!r}).acquire()"
+            f"QueueLock({str(tmp_path)!r}).acquire();"
+            "print('locked', flush=True);"
+            "threading.Event().wait()"
         )
-        result = subprocess.run(
+        holder = subprocess.Popen(
             [sys.executable, "-c", source],
             env={**os.environ, "PYTHONPATH": pkg_parent},
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        assert result.returncode == 0, result.stderr.decode()
-        assert (tmp_path / LOCK_FILENAME).exists()
+        replacement = QueueLock(tmp_path)
 
-        QueueLock(tmp_path).acquire()
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 5)
+            assert ready, "lock holder did not report readiness"
+            assert holder.stdout.readline().strip() == "locked"
+
+            with pytest.raises(QueueLockError):
+                replacement.acquire()
+
+            os.kill(holder.pid, signal.SIGKILL)
+            assert holder.wait(timeout=5) == -signal.SIGKILL
+
+            replacement.acquire()
+            assert replacement.is_held
+        finally:
+            replacement.release()
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=5)
 
 
 class TestQueueManagerIntegration:
