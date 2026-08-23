@@ -18,7 +18,8 @@ from typing import Dict, FrozenSet, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_RESUME_MESSAGE
-from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
+from .models import ExecutionResult, RateLimitInfo, QueuedPrompt, parse_optional_model
+from .paths import claude_config_dir
 
 
 # Rate-limit messages are written to stderr (not stdout) from this version onward.
@@ -82,6 +83,13 @@ _KILL_ESCALATION_TIMEOUT_S = 3
 _DRAIN_TIMEOUT_S = 2
 
 
+def _claude_subprocess_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    if env.get("CLAUDE_CONFIG_DIR"):
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir())
+    return env
+
+
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
 
@@ -121,7 +129,7 @@ class ClaudeCodeInterface:
                 if resolved:
                     self.claude_command = resolved
 
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--version"],
                 capture_output=True,
@@ -304,6 +312,7 @@ class ClaudeCodeInterface:
         the prompt, project, and queue configuration.
         """
         start_time = time.time()
+        _was_interrupted = False
 
         resuming = bool(prompt.session_id) and self._supports_resume
         if resuming:
@@ -366,6 +375,9 @@ class ClaudeCodeInterface:
                     if context_refs:
                         full_prompt = f"{' '.join(context_refs)} {prompt.content}"
 
+            if prompt.model is not None:
+                cmd.extend(["--model", parse_optional_model(prompt.model)])
+
             cmd.append(full_prompt)
 
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
@@ -374,15 +386,12 @@ class ClaudeCodeInterface:
             # Fix A — Strip CLAUDECODE so nested claude invocations are not blocked by the
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             # Each config directory carries its own credentials, so this decides
             # which account the run bills to. Without it a prompt would silently
             # spend whichever account the processor happened to start under.
             if prompt.claude_config_dir:
                 subprocess_env["CLAUDE_CONFIG_DIR"] = prompt.claude_config_dir
-
-            # Captures the interrupt flag across all exit paths — see finally block.
-            _was_interrupted = False
 
             proc = subprocess.Popen(
                 cmd,
@@ -705,7 +714,7 @@ class ClaudeCodeInterface:
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
@@ -729,7 +738,7 @@ class ClaudeCodeInterface:
     def get_available_commands(self) -> List[str]:
         """Get available Claude Code commands."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,

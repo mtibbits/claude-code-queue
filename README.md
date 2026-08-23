@@ -97,7 +97,7 @@ After installation, use the `claude-queue` command:
 **Quick prompt:**
 
 ```bash
-claude-queue add "Implement user authentication" --priority 1 --working-dir /path/to/project
+claude-queue add "Implement user authentication" --priority 1 --working-dir /path/to/project --model claude-sonnet-4-6
 ```
 
 **Template for detailed prompt:**
@@ -115,6 +115,7 @@ working_directory: .
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # Prompt Title
@@ -237,6 +238,7 @@ context_files:
   - docs/
 max_retries: 3
 estimated_tokens: 1500
+model: claude-sonnet-4-6
 ---
 
 # Update Project Documentation
@@ -371,6 +373,7 @@ context_files: # Files to include as context
     - README.md
 max_retries: 3 # Maximum total execution attempts (1 = no retries, -1 = unlimited)
 estimated_tokens: 1000 # Estimated token usage (optional)
+model: claude-sonnet-4-6 # Claude model ID (optional; null uses the configured default)
 resume_message: null # Sent when continuing an interrupted attempt (optional)
 ---
 ```

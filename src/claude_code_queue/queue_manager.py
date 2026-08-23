@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import signal
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
@@ -83,10 +84,18 @@ class QueueManager:
             print(f"Error: {e}", file=sys.stderr)
             return False
 
+        try:
+            return self._start_locked(callback)
+        finally:
+            self._lock.release()
+
+    def _start_locked(
+        self, callback: Optional[Callable[[QueueState], None]] = None
+    ) -> bool:
+        """Run startup and processing while ``start()`` owns the queue lock."""
         is_working, message = self.claude_interface.test_connection()
         if not is_working:
             print(f"Error: {message}")
-            self._lock.release()
             return False
 
         print(f"✓ {message}")
@@ -135,6 +144,7 @@ class QueueManager:
             print("\nShutdown requested by user")
         except Exception as e:
             print(f"Error in queue processing: {e}")
+            return False
         finally:
             self._shutdown()
 
@@ -172,7 +182,6 @@ class QueueManager:
             print("✓ Queue state saved")
 
         print("Queue manager stopped")
-        self._lock.release()
 
     def _process_queue_iteration(
         self, callback: Optional[Callable[[QueueState], None]] = None
@@ -506,6 +515,12 @@ class QueueManager:
         finds nothing, which is safe — nothing outside these session-scoped names
         is ever touched.
         """
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return 0
+        except (ValueError, AttributeError, TypeError):
+            return 0
+
         claude_dir = Path(config_dir).expanduser() if config_dir else claude_config_dir()
         targets = [
             # Todo stub — deterministic name.
@@ -523,6 +538,12 @@ class QueueManager:
                 deleted += 1
             except OSError:
                 pass  # never created by this run, already gone, or inaccessible
+
+        try:
+            (claude_dir / "session-env" / session_id).rmdir()
+            deleted += 1
+        except OSError:
+            pass
         return deleted
 
     def _format_duration(self, seconds: float) -> str:

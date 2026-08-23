@@ -295,6 +295,24 @@ class TestGenerateBatchJobs:
         assert prompts[0].priority == 5
         assert prompts[1].priority == 5
 
+    def test_model_from_template_is_preserved(self, tmp_path):
+        storage = QueueStorage(storage_dir=str(tmp_path / "storage"))
+        template = TEMPLATE_CONTENT.replace(
+            "estimated_tokens: 1000", "estimated_tokens: 1000\nmodel: claude-sonnet-4-6"
+        )
+        template_path, csv_path = self._make_template_and_csv(
+            tmp_path,
+            template,
+            "project,filename\nvolk,a.h\nvolk,b.h\n",
+        )
+
+        prompts = generate_batch_jobs(template_path, csv_path, storage)
+
+        assert [prompt.model for prompt in prompts] == [
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+        ]
+
     def test_base_priority_override(self, tmp_path):
         storage = QueueStorage(storage_dir=str(tmp_path / "storage"))
         template_path, csv_path = self._make_template_and_csv(

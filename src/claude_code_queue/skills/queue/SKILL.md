@@ -103,6 +103,7 @@ context_files:
   - tests/test_relevant.py
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # Task Title
@@ -128,6 +129,7 @@ What should be delivered when done.
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
 | `estimated_tokens` | Optional hint; set `null` if unknown. |
+| `model` | Claude model ID. Omit or set `null` to use the configured default. |
 | `resume_message` | Sent when continuing an interrupted attempt. Omit to use the configured default. |
 | `claude_config_dir` | Claude Code profile to bill. Set automatically from `$CLAUDE_CONFIG_DIR` at queue time. |
 
@@ -188,6 +190,7 @@ working_directory: /path/to/project
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 Refactor `{{filename}}` located at `{{filepath}}`:

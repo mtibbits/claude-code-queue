@@ -20,5 +20,5 @@ def claude_config_dir() -> Path:
     """
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     if configured:
-        return Path(configured).expanduser()
+        return Path(configured).expanduser().resolve()
     return Path.home() / ".claude"

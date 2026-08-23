@@ -24,7 +24,7 @@ from .batch import (
 )
 from .queue_manager import QueueManager
 from .storage import QueueStorage
-from .models import QueuedPrompt, PromptStatus
+from .models import QueuedPrompt, PromptStatus, parse_optional_model
 from .config import PROJECT_CONFIG_FILENAME, resolve_resume_message
 from .paths import claude_config_dir
 from .sessions import find_session, list_sessions
@@ -211,6 +211,13 @@ Examples:
     )
     add_parser.add_argument(
         "--estimated-tokens", "-t", type=int, help="Estimated token usage"
+    )
+    add_parser.add_argument(
+        "--model",
+        "-m",
+        type=parse_optional_model,
+        default=None,
+        help="Claude model ID (e.g. claude-haiku-4-5-20251001)",
     )
 
     template_parser = subparsers.add_parser(
@@ -400,6 +407,7 @@ def cmd_add(args) -> int:
         context_files=args.context_files,
         max_retries=args.max_retries,
         estimated_tokens=args.estimated_tokens,
+        model=args.model,
         claude_config_dir=_resolve_profile(args.profile),
     )
     # Use _save_single_prompt directly rather than load_queue_state() +
@@ -642,6 +650,8 @@ def cmd_status(args) -> int:
             print(
                 f"   {prompt.content[:80]}{'...' if len(prompt.content) > 80 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             if prompt.retry_count > 0:
                 print(f"   Retries: {prompt.retry_count}/{prompt.max_retries}")
 
@@ -691,6 +701,7 @@ def cmd_list(args) -> int:
                     "status": prompt.status.value,
                     "priority": prompt.priority,
                     "working_directory": prompt.working_directory,
+                    "model": prompt.model,
                     "created_at": prompt.created_at.isoformat(),
                     "retry_count": prompt.retry_count,
                     "max_retries": prompt.max_retries,
@@ -720,6 +731,8 @@ def cmd_list(args) -> int:
             print(
                 f"   {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             print(f"   Created: {prompt.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
     return 0
@@ -790,6 +803,8 @@ def cmd_bank_list(args) -> int:
         print(f"   Working directory: {template['working_directory']}")
         if template['estimated_tokens']:
             print(f"   Estimated tokens: {template['estimated_tokens']}")
+        if template.get('model'):
+            print(f"   Model: {template['model']}")
         print(f"   Modified: {template['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
         print()
 
@@ -1023,4 +1038,4 @@ def cmd_prompt_box(args) -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -257,6 +257,7 @@ working_directory: .     # Execution CWD (resolved relative)
 context_files: []        # Files passed as @-references
 max_retries: 3           # Total attempts (1=no retry, -1=unlimited)
 estimated_tokens: null   # Optional hint
+model: null              # Optional Claude model ID
 # Internal fields (managed by the queue, not user-edited):
 status: queued
 retry_count: 0
@@ -275,7 +276,7 @@ resume_message: null     # overrides the configured resume message
 | Command | Purpose | Needs `claude` binary? |
 |---|---|---|
 | `start [--verbose] [--no-skip-permissions]` | Run queue loop | Yes |
-| `add <prompt> [-p priority]` | Quick-add prompt | No |
+| `add <prompt> [-p priority] [-m model]` | Quick-add prompt | No |
 | `sessions [DIR] [--all] [--search t]` | List session ids and titles | No |
 | `resume-session [id] [-m msg]` | Queue a continuation of an existing session | No |
 | `template <name> [-p priority]` | Create template .md | No |

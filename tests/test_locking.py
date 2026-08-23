@@ -4,10 +4,12 @@ Single-writer lock over a queue storage directory.
 Two processors on one directory claim the same prompt and run the task twice, so
 these guards are load-bearing rather than cosmetic.
 
-Test IDs: LCK-001..LCK-014
+Test IDs: LCK-001..LCK-019
 """
 
 import os
+import select
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -51,7 +53,7 @@ class TestAcquireRelease:
     def test_release_frees_the_directory(self, lock, tmp_path):  # LCK-004
         lock.acquire()
         lock.release()
-        QueueLock(tmp_path).acquire()  # must not raise
+        QueueLock(tmp_path).acquire()
         assert not lock.is_held
 
     def test_release_is_safe_when_never_held(self, tmp_path):  # LCK-005
@@ -65,43 +67,89 @@ class TestAcquireRelease:
     def test_separate_directories_do_not_contend(self, tmp_path):  # LCK-007
         first, second = QueueLock(tmp_path / "a"), QueueLock(tmp_path / "b")
         first.acquire()
-        second.acquire()  # must not raise
+        second.acquire()
         first.release()
         second.release()
 
     def test_repeat_acquire_on_one_instance_is_a_noop(self, lock):  # LCK-008
         lock.acquire()
-        lock.acquire()  # must not deadlock or raise
+        lock.acquire()
         assert lock.is_held
 
     def test_context_manager_releases_on_exit(self, tmp_path):  # LCK-009
         with QueueLock(tmp_path):
             with pytest.raises(QueueLockError):
                 QueueLock(tmp_path).acquire()
-        QueueLock(tmp_path).acquire()  # must not raise
+        QueueLock(tmp_path).acquire()
 
     def test_lock_file_is_not_world_readable(self, lock, tmp_path):  # LCK-010
         lock.acquire()
         assert (tmp_path / LOCK_FILENAME).stat().st_mode & 0o077 == 0
 
+    def test_existing_lock_file_permissions_are_repaired(self, tmp_path):  # LCK-016
+        path = tmp_path / LOCK_FILENAME
+        path.write_text("stale")
+        path.chmod(0o666)
+
+        lock = QueueLock(tmp_path)
+        lock.acquire()
+        try:
+            assert path.stat().st_mode & 0o077 == 0
+        finally:
+            lock.release()
+
+    def test_symlinked_lock_file_is_rejected_without_touching_target(self, tmp_path):  # LCK-017
+        target = tmp_path / "unrelated"
+        target.write_text("keep me")
+        (tmp_path / LOCK_FILENAME).symlink_to(target)
+
+        with pytest.raises(QueueLockError):
+            QueueLock(tmp_path).acquire()
+
+        assert target.read_text() == "keep me"
+
     def test_lock_dies_with_the_holding_process(self, tmp_path):  # LCK-011
         """The kernel owns the lock, so a SIGKILLed processor leaves nothing to
         clean up by hand. A lock implemented with a plain marker file would strand
         the directory forever."""
+        if not hasattr(signal, "SIGKILL"):
+            pytest.skip("SIGKILL is not available on this platform")
+
         pkg_parent = str(Path(claude_code_queue.__file__).parent.parent)
         source = (
+            "import threading;"
             "from claude_code_queue.locking import QueueLock;"
-            f"QueueLock({str(tmp_path)!r}).acquire()"
+            f"QueueLock({str(tmp_path)!r}).acquire();"
+            "print('locked', flush=True);"
+            "threading.Event().wait()"
         )
-        result = subprocess.run(
+        holder = subprocess.Popen(
             [sys.executable, "-c", source],
             env={**os.environ, "PYTHONPATH": pkg_parent},
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        assert result.returncode == 0, result.stderr.decode()
-        assert (tmp_path / LOCK_FILENAME).exists()
+        replacement = QueueLock(tmp_path)
 
-        QueueLock(tmp_path).acquire()  # holder is gone; must not raise
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 5)
+            assert ready, "lock holder did not report readiness"
+            assert holder.stdout.readline().strip() == "locked"
+
+            with pytest.raises(QueueLockError):
+                replacement.acquire()
+
+            os.kill(holder.pid, signal.SIGKILL)
+            assert holder.wait(timeout=5) == -signal.SIGKILL
+
+            replacement.acquire()
+            assert replacement.is_held
+        finally:
+            replacement.release()
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=5)
 
 
 class TestQueueManagerIntegration:
@@ -123,7 +171,7 @@ class TestQueueManagerIntegration:
             manager, "_process_queue_iteration", side_effect=stop_after_one_pass
         )
         assert manager.start() is True
-        QueueLock(tmp_path).acquire()  # must not raise
+        QueueLock(tmp_path).acquire()
 
     def test_cli_start_exits_nonzero_when_locked(self, tmp_path, mocker):  # LCK-014
         """A supervisor has to see a refused start as a failure."""
@@ -136,6 +184,55 @@ class TestQueueManagerIntegration:
                 assert main() == 1
         finally:
             other.release()
+
+    def test_module_entrypoint_exits_nonzero_when_locked(self, tmp_path):  # LCK-014A
+        other = QueueLock(tmp_path)
+        other.acquire()
+        package_parent = str(Path(claude_code_queue.__file__).parent.parent)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "claude_code_queue.cli",
+                    "--storage-dir",
+                    str(tmp_path),
+                    "--claude-command",
+                    sys.executable,
+                    "start",
+                ],
+                env={**os.environ, "PYTHONPATH": package_parent},
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            other.release()
+
+        assert result.returncode == 1
+        assert "already being processed" in result.stderr
+
+    def test_startup_exception_releases_the_lock(self, manager, tmp_path, mocker):  # LCK-018
+        mocker.patch.object(
+            manager.storage,
+            "load_queue_state",
+            side_effect=OSError("broken queue state"),
+        )
+
+        with pytest.raises(OSError, match="broken queue state"):
+            manager.start()
+
+        replacement = QueueLock(tmp_path)
+        replacement.acquire()
+        replacement.release()
+
+    def test_processing_exception_reports_failure(self, manager, mocker):  # LCK-019
+        mocker.patch.object(
+            manager,
+            "_process_queue_iteration",
+            side_effect=OSError("queue directory disappeared"),
+        )
+
+        assert manager.start() is False
 
     def test_lock_file_is_not_mistaken_for_a_prompt(self, lock, tmp_path):  # LCK-015
         """The lock lives beside the queue/ directory, not inside it, so the

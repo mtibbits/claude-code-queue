@@ -67,6 +67,11 @@ class TestClaudeConfigDir:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         assert claude_config_dir() == tmp_path / ".claude"
 
+    def test_relative_value_is_anchored_to_the_queue_process(self, tmp_path, monkeypatch):  # ART-005
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+        assert claude_config_dir() == tmp_path / "profile"
+
 
 class TestArtifactRemoval:
     def test_removes_the_scratch_files(self, tmp_path, monkeypatch):  # ART-010
@@ -138,6 +143,25 @@ class TestArtifactRemoval:
         extra.write_text("x")
         assert QueueManager._do_cleanup_session_artifacts(SESSION_ID) == SCRATCH_COUNT + 1
         assert not extra.exists()
+
+    def test_removes_empty_session_environment_directory(self, tmp_path):  # ART-018
+        session_env = tmp_path / "session-env" / SESSION_ID
+        session_env.mkdir(parents=True)
+        assert QueueManager._do_cleanup_session_artifacts(SESSION_ID, str(tmp_path)) == 1
+        assert not session_env.exists()
+
+    def test_keeps_nonempty_session_environment_directory(self, tmp_path):  # ART-019
+        session_env = tmp_path / "session-env" / SESSION_ID
+        session_env.mkdir(parents=True)
+        (session_env / "unexpected").write_text("keep me")
+        assert QueueManager._do_cleanup_session_artifacts(SESSION_ID, str(tmp_path)) == 0
+        assert (session_env / "unexpected").read_text() == "keep me"
+
+    def test_rejects_non_uuid_session_id(self, tmp_path):  # ART-019A
+        victim = tmp_path / "victim.jsonl"
+        victim.write_text("keep me")
+        assert QueueManager._do_cleanup_session_artifacts("../../victim", str(tmp_path)) == 0
+        assert victim.read_text() == "keep me"
 
 
 class TestCleanupWrapper:
