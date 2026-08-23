@@ -85,7 +85,7 @@ path only.
 - **`--session-id` is feature-detected** once at startup (`--help` scan). Older
   CLIs reject the unknown flag, which would fail every queued prompt.
 - **Config directory honours `$CLAUDE_CONFIG_DIR`**, falling back to `~/.claude`
-  (`_claude_config_dir()`). Hardcoding `~/.claude` makes cleanup a silent no-op
+  (`claude_config_dir()`). Hardcoding `~/.claude` makes cleanup a silent no-op
   for anyone using a custom config directory.
 - **The conversation log is found via `projects/*/<uuid>.jsonl`**, not by
   rebuilding Claude Code's encoded project-directory name. That encoding rewrites
