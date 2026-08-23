@@ -8,7 +8,6 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -29,7 +28,49 @@ from .models import QueuedPrompt, PromptStatus, parse_optional_model
 from .paths import claude_config_dir
 
 
-_RATE_LIMIT_ERROR_TYPE = re.compile(r'"type"\s*:\s*"rate_limit_error"')
+_RATE_LIMIT_PREFIX = "Error: 429"
+
+
+def _is_rate_limit_error_record(record: object) -> bool:
+    """Return whether a Claude debug record is an Anthropic 429 error."""
+    if not isinstance(record, dict):
+        return False
+    error_text = record.get("error")
+    if not isinstance(error_text, str):
+        return False
+
+    error_lines = error_text.splitlines()
+    if not error_lines:
+        return False
+    first_line = error_lines[0].strip()
+    if not first_line.startswith(_RATE_LIMIT_PREFIX):
+        return False
+
+    try:
+        payload = json.loads(first_line[len(_RATE_LIMIT_PREFIX):].strip())
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+    if not isinstance(payload, dict) or payload.get("type") != "error":
+        return False
+    error = payload.get("error")
+    return isinstance(error, dict) and error.get("type") == "rate_limit_error"
+
+
+def _contains_rate_limit_error_record(content: str) -> bool:
+    """Return whether a Claude debug JSON document contains a real 429 record."""
+    try:
+        document = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+
+    records = document if isinstance(document, list) else [document]
+    return any(_is_rate_limit_error_record(record) for record in records)
+
+
+def _is_non_symlink_directory(path: Path) -> bool:
+    """Return whether path is a directory rather than a directory symlink."""
+    return path.is_dir() and not path.is_symlink()
 
 
 def main():
@@ -257,7 +298,7 @@ Examples:
     )
 
     cleanup_parser = subparsers.add_parser(
-        "cleanup", help="Remove rate-limit artifacts from ~/.claude/"
+        "cleanup", help="Remove rate-limit artifacts from the active Claude profile"
     )
     cleanup_parser.add_argument(
         "--dry-run", action="store_true",
@@ -759,15 +800,13 @@ def cmd_install_skill(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    """Remove rate-limit artifacts from ~/.claude/.
+    """Remove rate-limit artifacts from the active Claude profile.
 
     Identify sessions from canonical-UUID debug transcripts that contain a
-    429 rate_limit_error record. Delete correlated JSONL, todo, and telemetry
-    files before the debug marker so a failed run can retry.
-
-    This is the E3 pattern: no claude binary needed.
+    429 rate_limit_error record. Delete correlated JSONL, empty todo, telemetry,
+    and empty session environment artifacts before the debug marker.
     """
-    claude_dir = Path.home() / ".claude"
+    claude_dir = claude_config_dir()
     dry_run = args.dry_run
     matched = 0
     skipped = 0
@@ -775,8 +814,10 @@ def cmd_cleanup(args) -> int:
     failed_sessions: Set[str] = set()
 
     debug_dir = claude_dir / "debug"
-    if debug_dir.is_dir():
+    if _is_non_symlink_directory(debug_dir):
         for debug_file in debug_dir.glob("*.txt"):
+            if debug_file.is_symlink():
+                continue
             try:
                 with open(debug_file, "r", errors="replace") as fh:
                     content = fh.read()
@@ -791,11 +832,7 @@ def cmd_cleanup(args) -> int:
             if session_uuid != debug_file.stem:
                 continue
 
-            normalized_content = content.replace(r'\"', '"')
-            has_rate_limit_error = any(
-                "Error: 429" in line and _RATE_LIMIT_ERROR_TYPE.search(line)
-                for line in normalized_content.splitlines()
-            )
+            has_rate_limit_error = _contains_rate_limit_error_record(content)
             if has_rate_limit_error:
                 rate_limited_sessions[session_uuid] = debug_file
 
@@ -803,23 +840,48 @@ def cmd_cleanup(args) -> int:
         print(f"Identified {len(rate_limited_sessions)} rate-limited session(s)")
 
     projects_dir = claude_dir / "projects"
-    if projects_dir.is_dir():
-        for session_uuid in rate_limited_sessions:
-            for jsonl_file in projects_dir.glob(f"*/{session_uuid}.jsonl"):
+    if projects_dir.is_symlink():
+        skipped += 1
+        failed_sessions.update(rate_limited_sessions)
+    elif _is_non_symlink_directory(projects_dir):
+        try:
+            project_dirs = []
+            for path in projects_dir.iterdir():
+                if path.is_symlink():
+                    skipped += 1
+                    failed_sessions.update(rate_limited_sessions)
+                elif _is_non_symlink_directory(path):
+                    project_dirs.append(path)
+        except OSError:
+            skipped += 1
+            failed_sessions.update(rate_limited_sessions)
+            project_dirs = []
+
+        for project_dir in project_dirs:
+            for session_uuid in rate_limited_sessions:
+                jsonl_file = project_dir / f"{session_uuid}.jsonl"
+                if jsonl_file.is_symlink():
+                    continue
                 try:
                     if dry_run:
+                        if not jsonl_file.is_file():
+                            continue
                         print(f"  [dry-run] would delete {jsonl_file}")
                     else:
                         jsonl_file.unlink()
                     matched += 1
+                except FileNotFoundError:
+                    pass
                 except OSError:
                     skipped += 1
                     failed_sessions.add(session_uuid)
 
     todos_dir = claude_dir / "todos"
-    if todos_dir.is_dir():
+    if _is_non_symlink_directory(todos_dir):
         for session_uuid in rate_limited_sessions:
             todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
+            if todo_file.is_symlink():
+                continue
             try:
                 st = todo_file.stat()
                 if st.st_size <= 2:
@@ -835,9 +897,11 @@ def cmd_cleanup(args) -> int:
                 failed_sessions.add(session_uuid)
 
     telemetry_dir = claude_dir / "telemetry"
-    if telemetry_dir.is_dir():
+    if _is_non_symlink_directory(telemetry_dir):
         for session_uuid in rate_limited_sessions:
             for f in telemetry_dir.glob(f"1p_failed_events.{session_uuid}.*.json"):
+                if f.is_symlink():
+                    continue
                 try:
                     if dry_run:
                         print(f"  [dry-run] would delete {f}")
@@ -847,6 +911,24 @@ def cmd_cleanup(args) -> int:
                 except OSError:
                     skipped += 1
                     failed_sessions.add(session_uuid)
+
+    session_env_root = claude_dir / "session-env"
+    if _is_non_symlink_directory(session_env_root):
+        for session_uuid in rate_limited_sessions:
+            session_env_dir = session_env_root / session_uuid
+            if not _is_non_symlink_directory(session_env_dir):
+                continue
+            try:
+                if any(session_env_dir.iterdir()):
+                    continue
+                if dry_run:
+                    print(f"  [dry-run] would delete {session_env_dir}")
+                else:
+                    session_env_dir.rmdir()
+                matched += 1
+            except OSError:
+                skipped += 1
+                failed_sessions.add(session_uuid)
 
     for session_uuid, debug_file in rate_limited_sessions.items():
         if session_uuid in failed_sessions:
