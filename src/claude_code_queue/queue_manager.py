@@ -485,10 +485,10 @@ class QueueManager:
         """Delete *session_id*'s artifacts; return how many entries were removed.
 
         IMPORTANT: this depends on Claude Code's internal layout under the config
-        directory (``projects/``, ``todos/``, ``debug/``, ``telemetry/``). That
-        layout is undocumented and may change between versions; if it does,
-        cleanup silently stops finding files, which is safe — nothing outside
-        these four session-scoped names is ever touched.
+        directory (``projects/``, ``todos/``, ``debug/``, ``telemetry/``, and
+        ``session-env/``). That layout is undocumented and may change between
+        versions; if it does, cleanup silently stops finding files, which is safe:
+        nothing outside these session-scoped names is ever touched.
 
         The conversation log is found with a ``projects/*/<uuid>.jsonl`` glob
         rather than by rebuilding Claude Code's encoded project-directory name.
