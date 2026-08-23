@@ -191,7 +191,7 @@ Refactor `{{filename}}` located at `{{filepath}}`:
 ## Key Behavior Notes
 
 **`--dangerously-skip-permissions`**: Passed to `claude` by default so the
-daemon runs unattended. To disable interactive permission prompts:
+daemon runs unattended. To re-enable interactive permission prompts:
 `claude-queue start --no-skip-permissions`.
 
 **At-least-once semantics**: If the daemon crashes mid-execution, the task
