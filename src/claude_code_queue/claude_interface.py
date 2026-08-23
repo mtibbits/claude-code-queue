@@ -11,12 +11,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
-from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
+from .models import ExecutionResult, RateLimitInfo, QueuedPrompt, parse_optional_model
+from .paths import claude_config_dir
 
 
 # Rate-limit messages are written to stderr (not stdout) from this version onward.
@@ -80,8 +82,21 @@ _KILL_ESCALATION_TIMEOUT_S = 3
 _DRAIN_TIMEOUT_S = 2
 
 
+def _claude_subprocess_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    if env.get("CLAUDE_CONFIG_DIR"):
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir())
+    return env
+
+
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
+
+    # Whether the installed CLI accepts --session-id. _verify_claude_available()
+    # overrides this per instance; the class-level default keeps instances that
+    # bypass __init__ (and any instance whose verification was patched out) from
+    # emitting a flag the CLI may not understand.
+    _supports_session_id: bool = False
 
     def __init__(self, claude_command: str = "claude", timeout: int = 3600,
                  skip_permissions: bool = True):
@@ -112,7 +127,7 @@ class ClaudeCodeInterface:
                 if resolved:
                     self.claude_command = resolved
 
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--version"],
                 capture_output=True,
@@ -140,12 +155,34 @@ class ClaudeCodeInterface:
                         file=sys.stderr,
                     )
 
+            self._supports_session_id = self._detect_session_id_support(subprocess_env)
+
         except FileNotFoundError:
             raise RuntimeError(
                 f"Claude Code CLI not found. Make sure '{self.claude_command}' is in PATH."
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Claude Code CLI verification timed out.")
+
+    def _detect_session_id_support(self, subprocess_env: Dict[str, str]) -> bool:
+        """Return True when the installed claude CLI accepts ``--session-id``.
+
+        The queue supplies its own session UUID so rate-limit artifact cleanup can
+        identify the run's files exactly rather than guessing by size and mtime.
+        A CLI that predates the flag rejects it outright, which would fail every
+        queued prompt, so the flag is only used when ``--help`` advertises it.
+        """
+        try:
+            result = subprocess.run(
+                [self.claude_command, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=subprocess_env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and "--session-id" in result.stdout
 
     def _atexit_cleanup(self) -> None:
         """Wrapper for atexit — survives interpreter shutdown.
@@ -260,6 +297,11 @@ class ClaudeCodeInterface:
     def execute_prompt(self, prompt: QueuedPrompt) -> ExecutionResult:
         """Execute a prompt via Claude Code CLI."""
         start_time = time.time()
+        _was_interrupted = False
+
+        # Generated up front so a rate-limited run can be correlated to the exact
+        # artifact files it created (see QueueManager._do_cleanup_rate_limit_artifacts).
+        session_id = str(uuid.uuid4()) if self._supports_session_id else None
 
         try:
             working_dir = Path(prompt.working_directory).resolve()
@@ -288,6 +330,8 @@ class ClaudeCodeInterface:
             cmd = [self.claude_command, "--print"]
             if self.skip_permissions:
                 cmd.append("--dangerously-skip-permissions")
+            if session_id is not None:
+                cmd.extend(["--session-id", session_id])
 
             full_prompt = prompt.content
 
@@ -305,6 +349,9 @@ class ClaudeCodeInterface:
                 if context_refs:
                     full_prompt = f"{' '.join(context_refs)} {prompt.content}"
 
+            if prompt.model is not None:
+                cmd.extend(["--model", parse_optional_model(prompt.model)])
+
             cmd.append(full_prompt)
 
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
@@ -313,10 +360,7 @@ class ClaudeCodeInterface:
             # Fix A — Strip CLAUDECODE so nested claude invocations are not blocked by the
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-
-            # Captures the interrupt flag across all exit paths — see finally block.
-            _was_interrupted = False
+            subprocess_env = _claude_subprocess_env()
 
             proc = subprocess.Popen(
                 cmd,
@@ -419,6 +463,7 @@ class ClaudeCodeInterface:
                 rate_limit_info=rate_limit_info,
                 execution_time=execution_time,
                 is_non_retryable=is_non_retryable,
+                session_id=session_id,
             )
 
         except subprocess.TimeoutExpired:
@@ -428,6 +473,7 @@ class ClaudeCodeInterface:
                 output="",
                 error=f"Execution timed out after {self.timeout} seconds",
                 execution_time=execution_time,
+                session_id=session_id,
             )
         except Exception as e:
             # If a signal-driven kill was requested but communicate() raised
@@ -440,6 +486,7 @@ class ClaudeCodeInterface:
                 output="",
                 error=f"Execution failed: {str(e)}",
                 execution_time=execution_time,
+                session_id=session_id,
             )
 
     def _detect_rate_limit(
@@ -636,7 +683,7 @@ class ClaudeCodeInterface:
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
@@ -660,7 +707,7 @@ class ClaudeCodeInterface:
     def get_available_commands(self) -> List[str]:
         """Get available Claude Code commands."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,

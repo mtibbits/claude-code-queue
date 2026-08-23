@@ -56,6 +56,7 @@ def _make_template(
     priority=0,
     working_directory=".",
     estimated_tokens=None,
+    model=None,
     modified=None,
 ):
     """Build a bank-template dict like QueueStorage returns."""
@@ -67,6 +68,7 @@ def _make_template(
         "priority": priority,
         "working_directory": working_directory,
         "estimated_tokens": estimated_tokens,
+        "model": model,
         "modified": modified,
     }
 
@@ -234,6 +236,37 @@ class TestAddCommand:
         prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.estimated_tokens is None
 
+    def test_add_model_long_flag(self):
+        _, storage = self._run_add("--model", "claude-haiku-4-5-20251001")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "claude-haiku-4-5-20251001"
+
+    def test_add_model_short_flag(self):
+        _, storage = self._run_add("-m", "claude-sonnet-4-6")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "claude-sonnet-4-6"
+
+    def test_add_model_trims_whitespace(self):
+        _, storage = self._run_add("--model", "  sonnet  ")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "sonnet"
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_add_rejects_blank_model(self, model):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_add("--model", model)
+        assert exc_info.value.code == 2
+
+    def test_add_rejects_option_like_model(self):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_add("--model=--dangerously-skip-permissions")
+        assert exc_info.value.code == 2
+
+    def test_add_default_model_none(self):
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model is None
+
     def test_add_returns_zero_on_success(self):
         code, _ = self._run_add(success=True)
         assert code == 0
@@ -370,6 +403,12 @@ class TestStatusCommand:
         self._run_status("-d", state=state)
         captured = capsys.readouterr()
         assert "xyz99999" in captured.out
+
+    def test_status_detailed_shows_model(self, capsys):
+        p = QueuedPrompt(content="fix the bug", id="abc12345", model="sonnet")
+        state = _make_state(prompts=[p])
+        self._run_status("--detailed", state=state)
+        assert "Model: sonnet" in capsys.readouterr().out
 
     def test_status_shows_rate_limit_reset_time_when_rate_limited(self, capsys):
         reset_dt = datetime(2026, 3, 1, 15, 30, 0)
@@ -579,6 +618,16 @@ class TestListCommand:
         data = json.loads(capsys.readouterr().out)
         assert all("retry_count" in item and "max_retries" in item for item in data)
 
+    def test_list_json_item_has_model(self, capsys):
+        self._run_list("--json")
+        data = json.loads(capsys.readouterr().out)
+        assert all("model" in item for item in data)
+
+    def test_list_shows_model(self, capsys):
+        prompt = QueuedPrompt(id="p1", content="task", model="opus")
+        self._run_list(prompts=[prompt])
+        assert "Model: opus" in capsys.readouterr().out
+
     def test_list_empty_queue_prints_no_prompts_message(self, capsys):
         self._run_list(prompts=[])
         out = capsys.readouterr().out
@@ -704,6 +753,14 @@ class TestBankListCommand:
     def test_bank_list_omits_estimated_tokens_when_none(self, capsys):
         self._run_bank_list(templates=[_make_template(estimated_tokens=None)])
         assert "Estimated tokens" not in capsys.readouterr().out
+
+    def test_bank_list_shows_model_when_set(self, capsys):
+        self._run_bank_list(templates=[_make_template(model="claude-haiku-4-5-20251001")])
+        assert "claude-haiku-4-5-20251001" in capsys.readouterr().out
+
+    def test_bank_list_omits_model_when_none(self, capsys):
+        self._run_bank_list(templates=[_make_template(model=None)])
+        assert "Model:" not in capsys.readouterr().out
 
     def test_bank_list_shows_modified_timestamp(self, capsys):
         mod = datetime(2026, 3, 1, 10, 30, 0)
