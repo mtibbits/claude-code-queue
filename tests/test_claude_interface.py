@@ -343,6 +343,17 @@ def test_execute_prompt_model_flag_before_prompt_arg(interface):  # CLI-062
         )
 
 
+def test_execute_prompt_rejects_option_like_model(interface):
+    with patch("subprocess.Popen") as mock_popen:
+        result = interface.execute_prompt(
+            QueuedPrompt(content="task", model="--dangerously-skip-permissions")
+        )
+
+    mock_popen.assert_not_called()
+    assert result.success is False
+    assert "model must not start" in result.error
+
+
 def test_execute_prompt_success_returns_success_result(interface):  # CLI-026
     """returncode=0 with no rate-limit output → success=True."""
     mock_proc = make_mock_proc(returncode=0, stdout="All done", stderr="")

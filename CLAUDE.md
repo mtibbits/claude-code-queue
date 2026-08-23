@@ -6,7 +6,7 @@ Queue Claude Code prompts and execute them automatically when token limits reset
 Markdown-based persistent queue with YAML frontmatter, automatic rate-limit
 detection, priority scheduling, and retry logic.
 
-**Version**: 0.2.0
+**Version**: 0.5.0
 **Python**: >=3.8
 **Only runtime dependency**: PyYAML >= 6.0
 **Entry point**: `claude-queue` (console script via `claude_code_queue.cli:main`)
@@ -71,12 +71,65 @@ Tasks should be idempotent where possible.
 3. **Reset time**: parsed from `usage limit reached|<unix_ts>`, ISO timestamps, or estimated from 5-hour UTC boundaries (00, 05, 10, 15, 20)
 4. **Cap**: max 24 hours into the future (SC4 — prevents queue stall)
 
+### Rate-Limit Artifact Cleanup
+A rate-limited `claude --print` still writes a conversation log, a todo stub, a
+debug transcript, a session environment directory, and telemetry events. These
+artifacts can accumulate by the thousands and slow the Claude Code UI.
+`QueueManager._do_cleanup_rate_limit_artifacts()` removes them on the rate-limit
+path only.
+
+- **Correlation is exact, never heuristic.** `execute_prompt()` generates a UUID
+  and passes it as `--session-id`, so every artifact path is a known name for a
+  file this run created. When the UUID is unavailable the cleanup does nothing —
+  identifying files by size/mtime risks deleting an unrelated session's history.
+- **`--session-id` is feature-detected** once at startup (`--help` scan). Older
+  CLIs reject the unknown flag, which would fail every queued prompt.
+- **Config directory honours `$CLAUDE_CONFIG_DIR`**, falling back to `~/.claude`
+  (`claude_config_dir()`). Hardcoding `~/.claude` makes cleanup a silent no-op
+  for anyone using a custom config directory.
+- **The conversation log is found via `projects/*/<uuid>.jsonl`**, not by
+  rebuilding Claude Code's encoded project-directory name. That encoding rewrites
+  `.` and `_` to `-` as well as `/`, so recomputing it silently misses any project
+  path containing those characters.
+- Depends on undocumented Claude Code internals (`projects/`, `todos/`, `debug/`,
+  `session-env/`, `telemetry/`). If the layout changes, cleanup stops finding
+  entries. Nothing outside these session-scoped names is touched. Failures are
+  logged and swallowed so `save_queue_state()` always runs.
+
+### Session Usage Statistics
+After each execution, the queue prints the duration and reads token usage from
+the exact session JSONL file. `ExecutionResult.session_id` selects the file in
+the active `$CLAUDE_CONFIG_DIR` profile. The parser counts each assistant message
+ID once because Claude can store several events for one API response. It adds
+non-cached, cache-write, and cache-read tokens for the displayed input total.
+The prompt execution log keeps the detailed breakdown across all result paths.
+
 ### Retry Logic
 - `max_retries` = total attempts (3 = initial + 2 retries; -1 = unlimited)
 - Rate-limit hits and generic failures share the same `retry_count`
 - Generic failures get a 60s cooldown via `retry_not_before` (prevents spin loops)
 - Non-retryable errors (e.g., nested Claude session) → immediate FAILED, no retry budget consumed
 - Terminal status blocklist in `can_retry()`: COMPLETED and CANCELLED never retry
+
+### Single-Writer Lock
+`QueueManager.start()` takes an advisory exclusive lock on the storage directory
+(`.queue.lock`, `locking.QueueLock`) and refuses to start if another processor
+holds it.
+
+- **Why**: each tick reloads every prompt file, claims the highest-priority one,
+  and rewrites `queue-state.json` wholesale. Two processors on one directory
+  claim the same prompt — executing the task twice — and clobber each other's
+  counters. Queued tasks are advised to be idempotent, never required to be.
+- **`flock`/`msvcrt`, not a marker file**: the kernel holds the lock for the life
+  of the file descriptor, so it is released even on SIGKILL. There is no stale
+  lock to clear. The lock file is deliberately *not* unlinked on release —
+  unlinking lets a second processor lock an orphaned inode.
+- **Scope**: only `start` locks. Storage-only commands (`add`, `status`, `list`,
+  `bank`, `batch`) run freely alongside a live processor.
+- **Exit status**: `start()` returns False when it declines to start or the
+  processing loop aborts; `cmd_start` maps that to exit code 1 so a supervisor
+  sees a failed processor as a failure.
+- **Running several profiles**: give each its own `--storage-dir`.
 
 ### Signal Handling
 - SIGINT/SIGTERM → `kill_current()` sends SIGTERM to process group, daemon thread escalates to SIGKILL after 3s
@@ -182,6 +235,6 @@ retry_not_before: null
 | `test` | Verify claude CLI | Yes |
 | `bank save/list/use/delete` | Template bank ops | No |
 | `batch generate/validate/variables` | Batch job generation | No |
-| `cleanup [--dry-run]` | Remove rate-limit artifacts from ~/.claude/ | No |
+| `cleanup [--dry-run]` | Remove rate-limit artifacts from the active Claude profile | No |
 | `install-skill [--force]` | Copy SKILL.md to ~/.claude/skills/ | No |
 | `prompt-box` | Launch Rust TUI | No (needs Rust binary) |

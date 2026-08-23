@@ -7,13 +7,15 @@ import os
 import sys
 import time
 import signal
+import uuid
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any
 
 from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult, SessionStats
 from .storage import QueueStorage
 from .claude_interface import ClaudeCodeInterface
+from .locking import QueueLock, QueueLockError
+from .paths import claude_config_dir
 
 
 class QueueManager:
@@ -29,6 +31,7 @@ class QueueManager:
         generic_failure_retry_delay: int = 60,
     ):
         self.storage = QueueStorage(storage_dir)
+        self._lock = QueueLock(self.storage.base_dir)
         self.claude_interface = ClaudeCodeInterface(claude_command, timeout,
                                                     skip_permissions=skip_permissions)
         self.check_interval = check_interval
@@ -41,6 +44,13 @@ class QueueManager:
                 file=sys.stderr,
             )
         self._generic_failure_retry_delay = max(1, generic_failure_retry_delay)
+        # Idle-wait coordination between _process_queue_iteration() and start():
+        # seconds until the next known actionable moment (rate-limit reset or
+        # retry cooldown expiry), or None when there is nothing to wait for.
+        self._idle_wait_seconds: Optional[float] = None
+        # Dedup key for the waiting message so it prints once per wait state
+        # instead of on every poll iteration.
+        self._last_wait_key: Optional[str] = None
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -56,14 +66,35 @@ class QueueManager:
         self.claude_interface.kill_current()  # unblocks communicate() if executing
         self.stop()
 
-    def start(self, callback: Optional[Callable[[QueueState], None]] = None) -> None:
-        """Start the queue processing loop."""
+    def start(self, callback: Optional[Callable[[QueueState], None]] = None) -> bool:
+        """Start the queue processing loop.
+
+        Returns True once the loop has run and shut down, False when the processor
+        declined to start — the storage directory is already being processed, or
+        the claude CLI is unreachable. Callers map this to their exit status so a
+        supervisor sees a failed start as a failure.
+        """
         print("Starting Claude Code Queue Manager...")
 
+        try:
+            self._lock.acquire()
+        except QueueLockError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return False
+
+        try:
+            return self._start_locked(callback)
+        finally:
+            self._lock.release()
+
+    def _start_locked(
+        self, callback: Optional[Callable[[QueueState], None]] = None
+    ) -> bool:
+        """Run startup and processing while ``start()`` owns the queue lock."""
         is_working, message = self.claude_interface.test_connection()
         if not is_working:
             print(f"Error: {message}")
-            return
+            return False
 
         print(f"✓ {message}")
 
@@ -94,7 +125,16 @@ class QueueManager:
                 did_work = self._process_queue_iteration(callback)
 
                 if self.running and not did_work:
-                    time.sleep(self.check_interval)
+                    # Sleep until the next known actionable moment (rate-limit
+                    # reset / cooldown expiry) so the retry lands exactly on it,
+                    # but never longer than check_interval — prompts added to the
+                    # queue directory mid-wait still get picked up promptly.
+                    sleep_seconds = self.check_interval
+                    if self._idle_wait_seconds is not None:
+                        sleep_seconds = min(
+                            self.check_interval, max(1.0, self._idle_wait_seconds)
+                        )
+                    time.sleep(sleep_seconds)
 
         except KeyboardInterrupt:
             # print() is safe: we are in normal execution context, not signal-handler
@@ -102,8 +142,11 @@ class QueueManager:
             print("\nShutdown requested by user")
         except Exception as e:
             print(f"Error in queue processing: {e}")
+            return False
         finally:
             self._shutdown()
+
+        return True
 
     def stop(self) -> None:
         """Stop the queue processing loop."""
@@ -164,9 +207,33 @@ class QueueManager:
                 p for p in self.state.prompts if p.status == PromptStatus.RATE_LIMITED
             ]
             if rate_limited_prompts:
-                print(
-                    f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompts rate limited)"
-                )
+                reset_times = [
+                    p.reset_time for p in rate_limited_prompts if p.reset_time is not None
+                ]
+                if reset_times:
+                    soonest_reset = min(reset_times)
+                    remaining = max(0, (soonest_reset - datetime.now()).total_seconds())
+                    self._idle_wait_seconds = remaining
+                    # Print once per wait state (count + reset target), not per poll.
+                    wait_key = f"rl:{len(rate_limited_prompts)}:{soonest_reset:%Y-%m-%d %H:%M}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        hours, rest = divmod(int(remaining), 3600)
+                        minutes = rest // 60
+                        print(
+                            f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                            f"next reset at {soonest_reset:%H:%M} — in {hours}h {minutes:02d}m; "
+                            f"sleeping until then, new prompts still picked up)"
+                        )
+                else:
+                    self._idle_wait_seconds = None
+                    wait_key = f"rl-heuristic:{len(rate_limited_prompts)}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        print(
+                            f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                            f"no reset time parsed — retrying every 5 minutes)"
+                        )
             else:
                 now = datetime.now()
                 cooldown_prompts = [
@@ -178,12 +245,19 @@ class QueueManager:
                 if cooldown_prompts:
                     soonest = min(p.retry_not_before for p in cooldown_prompts)
                     wait = max(0, (soonest - now).total_seconds())
-                    print(
-                        f"Waiting for retry cooldown ({len(cooldown_prompts)} prompt(s) in backoff, "
-                        f"next eligible in {max(1, int(wait))}s)"
-                    )
+                    self._idle_wait_seconds = wait
+                    wait_key = f"cooldown:{len(cooldown_prompts)}:{soonest:%H:%M:%S}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        print(
+                            f"Waiting for retry cooldown ({len(cooldown_prompts)} prompt(s) in backoff, "
+                            f"next eligible in {max(1, int(wait))}s)"
+                        )
                 else:
-                    print("No prompts in queue")
+                    self._idle_wait_seconds = None
+                    if self._last_wait_key != "empty":
+                        self._last_wait_key = "empty"
+                        print("No prompts in queue")
 
             # Fix S8: _check_rate_limited_prompts() may have transitioned prompts to
             # FAILED. Save state so those transitions are persisted even when no prompt
@@ -193,6 +267,10 @@ class QueueManager:
             if callback:
                 callback(self.state)
             return False
+
+        # New work resets the wait-state dedup so the next wait announces itself.
+        self._last_wait_key = None
+        self._idle_wait_seconds = None
 
         print(f"Executing prompt {next_prompt.id}: {next_prompt.content[:50]}...")
         self._execute_prompt(next_prompt)
@@ -240,13 +318,6 @@ class QueueManager:
         prompt.status = PromptStatus.EXECUTING
         prompt.clear_retry_backoff()    # consumed; clear so it doesn't persist into .executing.md
         prompt.last_executed = datetime.now()
-        # Resolve working_directory once and stash it so cleanup uses the same
-        # path that claude_interface.execute_prompt() will use (avoids the bug
-        # where "." resolves to the queue-runner's CWD at cleanup time rather
-        # than at execution time).
-        prompt._resolved_working_directory = str(
-            Path(prompt.working_directory).resolve()
-        )
         retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
         prompt.add_log(
             f"Started execution (attempt {prompt.retry_count + 1}/{retries_str})"
@@ -267,10 +338,7 @@ class QueueManager:
         """Process the result of prompt execution."""
         execution_summary = f"Execution completed in {result.execution_time:.1f}s"
 
-        # Extract token usage from the JSONL conversation log BEFORE any branch
-        # logic runs.  CRITICAL: this must happen before _cleanup_rate_limit_artifacts()
-        # which deletes the JSONL file on the rate-limited path.
-        stats = self._extract_session_stats(prompt)
+        stats = self._extract_session_stats(prompt, result.session_id)
 
         if result.success:
             # retry_not_before is already None — cleared by _execute_prompt() via clear_retry_backoff().
@@ -282,6 +350,11 @@ class QueueManager:
 
             self.state.total_processed += 1
             print(f"✓ Prompt {prompt.id} completed successfully")
+            if result.output:
+                summary = result.output.strip()
+                if len(summary) > 1200:
+                    summary = summary[:1200].rstrip() + "\n… (truncated)"
+                print(f"--- Output ---\n{summary}\n--- (full output saved to completed/) ---")
             print(self._format_stats_line(result.execution_time, stats))
 
         elif result.is_non_retryable:
@@ -298,6 +371,8 @@ class QueueManager:
             print(
                 f"✗ Prompt {prompt.id} failed permanently (non-retryable error, no retry)"
             )
+            self._log_session_stats(prompt, stats)
+            print(self._format_stats_line(result.execution_time, stats))
 
         elif result.is_rate_limited:
             # Fix S4: prompt.status is EXECUTING at this point — checking it against
@@ -329,10 +404,16 @@ class QueueManager:
 
             if not was_already_rate_limited and self.state is not None:
                 self.state.rate_limited_count += 1
-            print(f"⚠ Prompt {prompt.id} rate limited, will retry later")
+            if prompt.reset_time is not None:
+                print(
+                    f"⚠ Prompt {prompt.id} rate limited, will retry after reset at "
+                    f"{prompt.reset_time:%H:%M}"
+                )
+            else:
+                print(f"⚠ Prompt {prompt.id} rate limited, will retry in 5 minutes")
             print(self._format_stats_line(result.execution_time, stats))
 
-            self._cleanup_rate_limit_artifacts(prompt)
+            self._cleanup_rate_limit_artifacts(prompt, result.session_id)
 
         else:
             prompt.retry_count += 1
@@ -374,115 +455,86 @@ class QueueManager:
 
         self.state.last_processed = datetime.now()
 
-    def _cleanup_rate_limit_artifacts(self, prompt: QueuedPrompt) -> None:
-        """Remove JSONL, todo, debug, and telemetry files from a rate-limited execution.
+    def _cleanup_rate_limit_artifacts(
+        self, prompt: QueuedPrompt, session_id: Optional[str]
+    ) -> None:
+        """Remove the artifact files this rate-limited execution left behind.
 
-        Safety layers:
-        1. Only files with mtime >= prompt.last_executed are considered
-        2. JSONL files must also be < 10 KB (rate-limited: 3-5 KB; successful: 100+ KB)
-        3. Todo files must be <= 2 bytes (the empty "[]" stub)
-        4. Debug and telemetry files are deleted only by UUID correlation with an
-           already-identified rate-limited JSONL file — no size heuristic needed
+        A rate-limited ``claude --print`` still writes a conversation log, a todo
+        stub, a debug transcript and telemetry events. Left alone they accumulate
+        (thousands per rate-limit window) until the Claude Code UI crawls loading
+        the junk history.
 
-        Wrapped in a top-level try/except so cleanup failures can never break the
-        execution-result pipeline (which must complete to persist the prompt's
-        RATE_LIMITED status to disk).
+        Deletion is keyed on *session_id* — the UUID this queue generated and
+        passed to the CLI via ``--session-id`` — so every path targeted is an exact
+        match for a file this execution created. When *session_id* is ``None`` (the
+        installed CLI predates the flag) nothing is deleted: identifying the files
+        heuristically, by size and mtime, risks destroying an unrelated session's
+        history.
+
+        Failures are logged and swallowed. Propagating would skip
+        save_queue_state(), leaving the prompt as ``.executing.md`` on disk and
+        causing a re-queue loop on the next start.
         """
-        if not prompt.last_executed:
+        if session_id is None:
             return
 
         try:
-            self._do_cleanup_rate_limit_artifacts(prompt)
+            deleted = self._do_cleanup_rate_limit_artifacts(session_id)
         except Exception as e:
-            # Log but never propagate — cleanup is best-effort.
-            # Propagating would prevent save_queue_state() from running,
-            # leaving the prompt as .executing.md on disk and causing a
-            # re-queue loop on restart.
             prompt.add_log(f"Warning: artifact cleanup failed: {e}")
             print(f"Warning: artifact cleanup failed: {e}")
-
-    def _do_cleanup_rate_limit_artifacts(self, prompt: QueuedPrompt) -> None:
-        """Inner implementation — may raise; caller catches all exceptions.
-
-        IMPORTANT: This method relies on Claude Code's internal file layout under
-        ~/.claude/ (projects/, todos/, debug/, telemetry/). This is undocumented
-        internal structure that may change across Claude Code versions. If the
-        layout changes, cleanup will silently stop working (safe — no data loss).
-        The path encoding (resolved.replace("/", "-")) mirrors Claude Code's
-        current project directory naming convention.
-        """
-        cutoff = prompt.last_executed.timestamp()
-        claude_dir = Path.home() / ".claude"
-        deleted = 0
-        rate_limited_uuids: List[str] = []
-
-        # 1. JSONL conversation logs — primary identification of rate-limited sessions
-        #    Use the resolved path stashed by _execute_prompt() so we match the
-        #    exact directory that claude_interface used, even when working_directory
-        #    was relative (e.g. ".").
-        resolved = prompt._resolved_working_directory or str(
-            Path(prompt.working_directory).resolve()
-        )
-        encoded = resolved.replace("/", "-")
-        jsonl_dir = claude_dir / "projects" / encoded
-        if jsonl_dir.is_dir():
-            for f in jsonl_dir.glob("*.jsonl"):
-                try:
-                    st = f.stat()
-                    if st.st_mtime >= cutoff and st.st_size < 10_000:
-                        rate_limited_uuids.append(f.stem)
-                        f.unlink()
-                        deleted += 1
-                        break  # one subprocess = one session UUID
-                except OSError:
-                    pass  # file already gone or inaccessible
-
-        # 2. Todo stub files — by UUID correlation with size guard
-        #    Pattern: <session_uuid>-agent-<session_uuid>.json
-        #    Rate-limited stubs are exactly 2 bytes ("[]")
-        todos_dir = claude_dir / "todos"
-        if todos_dir.is_dir() and rate_limited_uuids:
-            for session_uuid in rate_limited_uuids:
-                todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
-                try:
-                    st = todo_file.stat()
-                    if st.st_size <= 2:
-                        todo_file.unlink()
-                        deleted += 1
-                except OSError:
-                    pass  # file doesn't exist or inaccessible
-
-        # 3. Debug transcript files — by UUID correlation with timestamp guard
-        #    No size heuristic: the gap between rate-limited (12-14 KB) and
-        #    successful (26 KB+) is too narrow.  The timestamp guard defends
-        #    against the (theoretical) case of UUID reuse across sessions.
-        debug_dir = claude_dir / "debug"
-        if debug_dir.is_dir() and rate_limited_uuids:
-            for session_uuid in rate_limited_uuids:
-                debug_file = debug_dir / f"{session_uuid}.txt"
-                try:
-                    st = debug_file.stat()
-                    if st.st_mtime >= cutoff:
-                        debug_file.unlink()
-                        deleted += 1
-                except OSError:
-                    pass  # file doesn't exist or inaccessible
-
-        # 4. Telemetry failed event files — by UUID correlation
-        #    Pattern: 1p_failed_events.<session_uuid>.<other_uuid>.json
-        telemetry_dir = claude_dir / "telemetry"
-        if telemetry_dir.is_dir() and rate_limited_uuids:
-            for session_uuid in rate_limited_uuids:
-                for f in telemetry_dir.glob(f"1p_failed_events.{session_uuid}.*.json"):
-                    try:
-                        f.unlink()
-                        deleted += 1
-                    except OSError:
-                        pass
+            return
 
         if deleted:
             prompt.add_log(f"Cleaned up {deleted} rate-limit artifact(s)")
             print(f"[cleanup] Removed {deleted} rate-limit artifact(s)")
+
+    @staticmethod
+    def _do_cleanup_rate_limit_artifacts(session_id: str) -> int:
+        """Delete *session_id*'s artifacts; return how many entries were removed.
+
+        IMPORTANT: this depends on Claude Code's internal layout under the config
+        directory (``projects/``, ``todos/``, ``debug/``, ``telemetry/``, and
+        ``session-env/``). That layout is undocumented and may change between
+        versions; if it does, cleanup silently stops finding files, which is safe:
+        nothing outside these session-scoped names is ever touched.
+
+        The conversation log is found with a ``projects/*/<uuid>.jsonl`` glob
+        rather than by rebuilding Claude Code's encoded project-directory name.
+        That encoding rewrites ``.`` and ``_`` to ``-`` as well as ``/``, so
+        recomputing it silently misses any project path containing those
+        characters. A session UUID is unique on its own, which makes the glob both
+        simpler and exact.
+        """
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return 0
+        except (ValueError, AttributeError):
+            return 0
+
+        claude_dir = claude_config_dir()
+        targets = [
+            *claude_dir.glob(f"projects/*/{session_id}.jsonl"),
+            claude_dir / "todos" / f"{session_id}-agent-{session_id}.json",
+            claude_dir / "debug" / f"{session_id}.txt",
+            *claude_dir.glob(f"telemetry/1p_failed_events.{session_id}.*.json"),
+        ]
+
+        deleted = 0
+        for target in targets:
+            try:
+                target.unlink()
+                deleted += 1
+            except OSError:
+                pass  # never created by this run, already gone, or inaccessible
+
+        try:
+            (claude_dir / "session-env" / session_id).rmdir()
+            deleted += 1
+        except OSError:
+            pass
+        return deleted
 
     def _format_duration(self, seconds: float) -> str:
         """Format duration in seconds to human readable format."""
@@ -501,79 +553,89 @@ class QueueManager:
                 return f"{hours}h"
             return f"{hours}h {minutes}m"
 
-    def _extract_session_stats(self, prompt: QueuedPrompt) -> Optional[SessionStats]:
-        """Extract token usage from the JSONL conversation log for a just-finished execution.
-
-        Locates the JSONL file using the same path-encoding logic as
-        _do_cleanup_rate_limit_artifacts(), then sums usage across all assistant
-        turns.
-
-        Returns None if the JSONL cannot be found or parsed.
-        Best-effort: failures are logged but never propagate.
-
-        IMPORTANT: This method relies on Claude Code's internal file layout under
-        ~/.claude/projects/. See _do_cleanup_rate_limit_artifacts() for the same
-        caveat about undocumented internal structure.
-        """
-        if not prompt.last_executed:
+    def _extract_session_stats(
+        self, prompt: QueuedPrompt, session_id: Optional[str]
+    ) -> Optional[SessionStats]:
+        """Return token usage for this execution's exact Claude session."""
+        if session_id is None:
             return None
 
         try:
-            return self._do_extract_session_stats(prompt)
+            return self._do_extract_session_stats(session_id)
         except Exception as e:
             prompt.add_log(f"Warning: session stats extraction failed: {e}")
             return None
 
-    def _do_extract_session_stats(self, prompt: QueuedPrompt) -> Optional[SessionStats]:
-        """Inner implementation — may raise; caller catches all exceptions."""
-        cutoff = prompt.last_executed.timestamp()
-        claude_dir = Path.home() / ".claude"
+    @staticmethod
+    def _do_extract_session_stats(session_id: str) -> Optional[SessionStats]:
+        """Read usage from one canonical session in the active Claude profile."""
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return None
+        except (ValueError, AttributeError):
+            return None
 
-        resolved = prompt._resolved_working_directory or str(
-            Path(prompt.working_directory).resolve()
+        matches = list(claude_config_dir().glob(f"projects/*/{session_id}.jsonl"))
+        if not matches:
+            return None
+
+        session_file = max(matches, key=lambda path: path.stat().st_mtime)
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
         )
-        encoded = resolved.replace("/", "-")
-        jsonl_dir = claude_dir / "projects" / encoded
-
-        if not jsonl_dir.is_dir():
-            return None
-
-        # Find the newest .jsonl file with mtime >= cutoff (no size cap).
-        best_file = None
-        best_mtime = 0.0
-        for f in jsonl_dir.glob("*.jsonl"):
-            try:
-                st = f.stat()
-                if st.st_mtime >= cutoff and st.st_mtime > best_mtime:
-                    best_mtime = st.st_mtime
-                    best_file = f
-            except OSError:
-                pass
-
-        if best_file is None:
-            return None
-
-        # Sum usage across all assistant turns, line-by-line.
-        stats = SessionStats()
-        with open(best_file, "r") as fh:
+        usage_by_message: Dict[str, Dict[str, int]] = {}
+        with open(session_file, "r", encoding="utf-8") as fh:
             for line in fh:
                 try:
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if obj.get("type") != "assistant" or "message" not in obj:
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
                     continue
-                usage = obj["message"].get("usage", {})
-                stats.input_tokens += usage.get("input_tokens", 0)
-                stats.output_tokens += usage.get("output_tokens", 0)
-                stats.cache_creation_input_tokens += usage.get("cache_creation_input_tokens", 0)
-                stats.cache_read_input_tokens += usage.get("cache_read_input_tokens", 0)
-                stats.api_turns += 1
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                message_id = message.get("id")
+                usage = message.get("usage")
+                if not isinstance(message_id, str) or not message_id:
+                    continue
+                if not isinstance(usage, dict):
+                    continue
+                values = {field: usage.get(field, 0) for field in fields}
+                if any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in values.values()
+                ):
+                    continue
 
-        if stats.api_turns == 0:
+                prior = usage_by_message.setdefault(
+                    message_id, {field: 0 for field in fields}
+                )
+                # Claude can repeat one API message for thinking and text events.
+                # Counters repeat or grow, so keep each field's final high-water mark.
+                for field, value in values.items():
+                    prior[field] = max(prior[field], value)
+
+        if not usage_by_message:
             return None
 
-        return stats
+        return SessionStats(
+            input_tokens=sum(item["input_tokens"] for item in usage_by_message.values()),
+            output_tokens=sum(item["output_tokens"] for item in usage_by_message.values()),
+            cache_creation_input_tokens=sum(
+                item["cache_creation_input_tokens"]
+                for item in usage_by_message.values()
+            ),
+            cache_read_input_tokens=sum(
+                item["cache_read_input_tokens"] for item in usage_by_message.values()
+            ),
+            api_turns=len(usage_by_message),
+        )
 
     def _format_stats_line(
         self, execution_time: float, stats: Optional[SessionStats]

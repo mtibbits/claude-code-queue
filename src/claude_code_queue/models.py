@@ -9,6 +9,20 @@ from typing import List, Optional, Dict, Any
 import uuid
 
 
+def parse_optional_model(value: Any) -> Optional[str]:
+    """Return a valid optional Claude model ID."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("model must be a non-empty string or null")
+    model = value.strip()
+    if not model:
+        raise ValueError("model must be a non-empty string or null")
+    if model.startswith("-"):
+        raise ValueError("model must not start with '-'")
+    return model
+
+
 class PromptStatus(Enum):
     """Status of a queued prompt."""
 
@@ -40,7 +54,6 @@ class QueuedPrompt:
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
-    _resolved_working_directory: Optional[str] = field(default=None, repr=False)  # transient; not persisted to YAML
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""
@@ -259,7 +272,11 @@ class SessionStats:
     @property
     def total_input_tokens(self) -> int:
         """Total tokens billed as input (non-cached + cache-write + cache-read)."""
-        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+        return (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
 
 
 @dataclass
@@ -272,6 +289,7 @@ class ExecutionResult:
     rate_limit_info: Optional[RateLimitInfo] = None
     execution_time: float = 0.0
     is_non_retryable: bool = False  # True if the error is permanent regardless of retry count
+    session_id: Optional[str] = None  # UUID passed via --session-id; None when the CLI lacks the flag
 
     @property
     def is_rate_limited(self) -> bool:

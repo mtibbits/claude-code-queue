@@ -5,10 +5,9 @@ Test IDs use the SS- prefix for cross-reference.
 """
 
 import json
-import os
-from datetime import datetime, timedelta
-from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from claude_code_queue.models import (
     SessionStats,
@@ -17,6 +16,9 @@ from claude_code_queue.models import (
     ExecutionResult,
     RateLimitInfo,
 )
+
+SESSION_ID = "11111111-2222-4333-8444-555555555555"
+OTHER_SESSION_ID = "99999999-8888-4777-8666-555555555555"
 
 
 # ---------------------------------------------------------------------------
@@ -29,11 +31,13 @@ def _make_assistant_line(
     output_tokens=20,
     cache_creation=100,
     cache_read=200,
+    message_id="msg_default",
 ):
     """Build a single JSONL assistant line with the given usage values."""
     return json.dumps({
         "type": "assistant",
         "message": {
+            "id": message_id,
             "role": "assistant",
             "content": [{"type": "text", "text": "hello"}],
             "usage": {
@@ -80,33 +84,23 @@ def _write_jsonl(path, lines):
     return path
 
 
-def _setup_jsonl_for_prompt(tmp_path, prompt, lines):
-    """Create the JSONL file in the expected directory structure for a prompt.
-
-    Returns the path to the JSONL file.
-    """
-    resolved = prompt._resolved_working_directory or str(
-        Path(prompt.working_directory).resolve()
-    )
-    encoded = resolved.replace("/", "-")
-    jsonl_dir = tmp_path / ".claude" / "projects" / encoded
-    jsonl_file = jsonl_dir / "session-uuid.jsonl"
+def _setup_jsonl(tmp_path, lines, session_id=SESSION_ID, project="project"):
+    """Create one Claude session JSONL file in a test profile."""
+    jsonl_file = tmp_path / "profile" / "projects" / project / f"{session_id}.jsonl"
     _write_jsonl(jsonl_file, lines)
     return jsonl_file
 
 
 def _make_stats_prompt(tmp_path):
-    """Create a QueuedPrompt wired to a working directory under tmp_path."""
-    work_dir = tmp_path / "workdir"
-    work_dir.mkdir(exist_ok=True)
-    prompt = QueuedPrompt(
-        id="abc12345",
-        content="test",
-        working_directory=str(work_dir),
+    """Create a prompt used to capture best-effort extraction warnings."""
+    return QueuedPrompt(id="abc12345", content="test", working_directory=str(tmp_path))
+
+
+def _use_test_profile(mocker, tmp_path):
+    return mocker.patch(
+        "claude_code_queue.queue_manager.claude_config_dir",
+        return_value=tmp_path / "profile",
     )
-    prompt.last_executed = datetime.now() - timedelta(seconds=5)
-    prompt._resolved_working_directory = str(work_dir)
-    return prompt
 
 
 # ===========================================================================
@@ -143,15 +137,14 @@ def test_session_stats_total_input_zero_when_all_zero():  # SS-003
 
 
 def test_extract_stats_single_turn(manager, tmp_path, mocker):  # SS-010
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_user_line(),
         _make_assistant_line(input_tokens=5, output_tokens=50, cache_creation=1000, cache_read=2000),
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.input_tokens == 5
@@ -163,19 +156,18 @@ def test_extract_stats_single_turn(manager, tmp_path, mocker):  # SS-010
 
 
 def test_extract_stats_multi_turn(manager, tmp_path, mocker):  # SS-011
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_user_line(),
-        _make_assistant_line(input_tokens=3, output_tokens=100, cache_creation=5000, cache_read=8000),
+        _make_assistant_line(input_tokens=3, output_tokens=100, cache_creation=5000, cache_read=8000, message_id="msg_1"),
         _make_user_line(),
-        _make_assistant_line(input_tokens=1, output_tokens=200, cache_creation=5000, cache_read=8000),
+        _make_assistant_line(input_tokens=1, output_tokens=200, cache_creation=5000, cache_read=8000, message_id="msg_2"),
         _make_user_line(),
-        _make_assistant_line(input_tokens=1, output_tokens=150, cache_creation=0, cache_read=10000),
+        _make_assistant_line(input_tokens=1, output_tokens=150, cache_creation=0, cache_read=10000, message_id="msg_3"),
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.input_tokens == 5
@@ -187,17 +179,16 @@ def test_extract_stats_multi_turn(manager, tmp_path, mocker):  # SS-011
 
 
 def test_extract_stats_non_assistant_lines_ignored(manager, tmp_path, mocker):  # SS-012
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_queue_op_line(),
         _make_user_line(),
         _make_assistant_line(input_tokens=3, output_tokens=10, cache_creation=100, cache_read=200),
         _make_last_prompt_line(),
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.input_tokens == 3
@@ -205,43 +196,44 @@ def test_extract_stats_non_assistant_lines_ignored(manager, tmp_path, mocker):  
     assert stats.api_turns == 1
 
 
-def test_extract_stats_missing_usage_block(manager, tmp_path, mocker):  # SS-013
-    """Assistant line without message.usage should contribute 0."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+def test_extract_stats_missing_usage_block_is_skipped(manager, tmp_path, mocker):  # SS-013
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
     line_no_usage = json.dumps({
         "type": "assistant",
         "message": {
+            "id": "msg_missing_usage",
             "role": "assistant",
             "content": [{"type": "text", "text": "hi"}],
         },
     })
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         line_no_usage,
         _make_assistant_line(input_tokens=5, output_tokens=10, cache_creation=100, cache_read=200),
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
-    assert stats.api_turns == 2
+    assert stats.api_turns == 1
     assert stats.input_tokens == 5
     assert stats.output_tokens == 10
 
 
 def test_extract_stats_malformed_line_skipped(manager, tmp_path, mocker):  # SS-014
-    """Non-JSON lines should be skipped; valid lines still counted."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         "this is not json",
+        "null",
+        "[]",
+        json.dumps({"type": "assistant", "message": []}),
+        json.dumps({"type": "assistant", "message": {"id": "bad", "usage": []}}),
         _make_assistant_line(input_tokens=7, output_tokens=30, cache_creation=500, cache_read=600),
         "{bad json",
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.input_tokens == 7
@@ -249,105 +241,110 @@ def test_extract_stats_malformed_line_skipped(manager, tmp_path, mocker):  # SS-
     assert stats.api_turns == 1
 
 
-def test_extract_stats_old_mtime_returns_none(manager, tmp_path, mocker):  # SS-015
-    """JSONL file exists but mtime is before cutoff — returns None."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+@pytest.mark.parametrize("value", ["10", 1.5, True, -1, None, [], {}])
+def test_extract_stats_invalid_token_value_is_skipped(
+    manager, tmp_path, mocker, value
+):  # SS-015
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [
-        _make_assistant_line(),
+    _setup_jsonl(tmp_path, [
+        _make_assistant_line(input_tokens=value, message_id="msg_invalid"),
+        _make_assistant_line(input_tokens=7, output_tokens=8, cache_creation=9, cache_read=10, message_id="msg_valid"),
     ])
-    old_time = (prompt.last_executed - timedelta(hours=1)).timestamp()
-    os.utime(jsonl_file, (old_time, old_time))
 
-    stats = manager._extract_session_stats(prompt)
-    assert stats is None
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
+
+    assert stats is not None
+    assert stats.api_turns == 1
+    assert stats.total_input_tokens == 26
 
 
 def test_extract_stats_empty_file(manager, tmp_path, mocker):  # SS-016
-    """Empty JSONL file — returns None (0 API turns)."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    jsonl_file = _setup_jsonl_for_prompt(tmp_path, prompt, [])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
+    _setup_jsonl(tmp_path, [])
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
     assert stats is None
 
 
 def test_extract_stats_directory_missing(manager, tmp_path, mocker):  # SS-017
-    """~/.claude/projects/<encoded>/ doesn't exist — returns None."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
     assert stats is None
 
 
-def test_extract_stats_resolved_dir_none_fallback(manager, tmp_path, mocker):  # SS-018
-    """When _resolved_working_directory is None, falls back to resolving working_directory."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+def test_extract_stats_uses_active_profile(manager, tmp_path, mocker):  # SS-018
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    prompt._resolved_working_directory = None
-    resolved = str(Path(prompt.working_directory).resolve())
-    encoded = resolved.replace("/", "-")
-    jsonl_dir = tmp_path / ".claude" / "projects" / encoded
-    jsonl_file = jsonl_dir / "session.jsonl"
-    _write_jsonl(jsonl_file, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=1, output_tokens=2, cache_creation=3, cache_read=4),
     ])
-    os.utime(jsonl_file, (datetime.now().timestamp(), datetime.now().timestamp()))
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.total_input_tokens == 8
 
 
-def test_extract_stats_last_executed_none(manager, tmp_path):  # SS-019
-    """When last_executed is None, returns None immediately."""
+@pytest.mark.parametrize("session_id", [None, "", "../../victim", "NOT-A-UUID"])
+def test_extract_stats_rejects_unknown_or_invalid_session_id(
+    manager, tmp_path, mocker, session_id
+):  # SS-019
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    prompt.last_executed = None
+    _setup_jsonl(tmp_path, [_make_assistant_line()])
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, session_id)
     assert stats is None
 
 
-def test_extract_stats_newest_file_selected(manager, tmp_path, mocker):  # SS-020
-    """When multiple JSONL files match, the newest one is used."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+def test_extract_stats_ignores_newer_unrelated_session(manager, tmp_path, mocker):  # SS-020
+    _use_test_profile(mocker, tmp_path)
     prompt = _make_stats_prompt(tmp_path)
-    resolved = prompt._resolved_working_directory
-    encoded = resolved.replace("/", "-")
-    jsonl_dir = tmp_path / ".claude" / "projects" / encoded
-    jsonl_dir.mkdir(parents=True, exist_ok=True)
-
-    older = jsonl_dir / "old-session.jsonl"
-    _write_jsonl(older, [
-        _make_assistant_line(input_tokens=999, output_tokens=999, cache_creation=0, cache_read=0),
-    ])
-    old_time = datetime.now().timestamp() - 2
-    os.utime(older, (old_time, old_time))
-
-    newer = jsonl_dir / "new-session.jsonl"
-    _write_jsonl(newer, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=1, output_tokens=2, cache_creation=3, cache_read=4),
     ])
-    new_time = datetime.now().timestamp()
-    os.utime(newer, (new_time, new_time))
+    _setup_jsonl(tmp_path, [
+        _make_assistant_line(input_tokens=999, output_tokens=999, cache_creation=999, cache_read=999),
+    ], session_id=OTHER_SESSION_ID, project="other-project")
 
-    stats = manager._extract_session_stats(prompt)
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
 
     assert stats is not None
     assert stats.input_tokens == 1
     assert stats.output_tokens == 2
 
 
+def test_extract_stats_deduplicates_streamed_assistant_events(
+    manager, tmp_path, mocker
+):
+    _use_test_profile(mocker, tmp_path)
+    prompt = _make_stats_prompt(tmp_path)
+    _setup_jsonl(tmp_path, [
+        _make_assistant_line(input_tokens=2, output_tokens=4, cache_creation=100, cache_read=200, message_id="msg_streamed"),
+        _make_assistant_line(input_tokens=2, output_tokens=809, cache_creation=100, cache_read=200, message_id="msg_streamed"),
+        _make_assistant_line(input_tokens=0, output_tokens=0, cache_creation=0, cache_read=0, message_id="msg_streamed"),
+    ])
+
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
+
+    assert stats is not None
+    assert stats.api_turns == 1
+    assert stats.input_tokens == 2
+    assert stats.output_tokens == 809
+    assert stats.cache_creation_input_tokens == 100
+    assert stats.cache_read_input_tokens == 200
+
+
 def test_extract_stats_exception_returns_none(manager, tmp_path):  # SS-021
-    """Internal errors are caught and None is returned."""
     prompt = _make_stats_prompt(tmp_path)
     with patch.object(manager, "_do_extract_session_stats", side_effect=OSError("boom")):
-        stats = manager._extract_session_stats(prompt)
+        stats = manager._extract_session_stats(prompt, SESSION_ID)
     assert stats is None
+    assert "session stats extraction failed" in prompt.execution_log
 
 
 # ===========================================================================
@@ -428,15 +425,20 @@ def test_log_session_stats_single_turn_singular(manager):  # SS-052
 
 
 def test_result_success_prints_stats(manager, tmp_path, mocker, capsys):  # SS-040
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
     manager.state.add_prompt(prompt)
-    _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=5, output_tokens=50, cache_creation=1000, cache_read=2000),
     ])
-    result = ExecutionResult(success=True, output="done", execution_time=120.5)
+    result = ExecutionResult(
+        success=True,
+        output="done",
+        execution_time=120.5,
+        session_id=SESSION_ID,
+    )
 
     manager._process_execution_result(prompt, result)
 
@@ -448,7 +450,7 @@ def test_result_success_prints_stats(manager, tmp_path, mocker, capsys):  # SS-0
 
 
 def test_result_success_no_jsonl_prints_duration_only(manager, tmp_path, mocker, capsys):  # SS-041
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
@@ -464,12 +466,12 @@ def test_result_success_no_jsonl_prints_duration_only(manager, tmp_path, mocker,
 
 def test_result_rate_limited_prints_stats_before_cleanup(manager, tmp_path, mocker, capsys):  # SS-042
     """Stats must be extracted BEFORE cleanup deletes the JSONL."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
     manager.state.add_prompt(prompt)
-    _setup_jsonl_for_prompt(tmp_path, prompt, [
+    jsonl_file = _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=3, output_tokens=10, cache_creation=500, cache_read=600),
     ])
 
@@ -483,6 +485,7 @@ def test_result_rate_limited_prints_stats_before_cleanup(manager, tmp_path, mock
         error="rate limited",
         rate_limit_info=rate_info,
         execution_time=5.0,
+        session_id=SESSION_ID,
     )
 
     manager._process_execution_result(prompt, result)
@@ -491,19 +494,24 @@ def test_result_rate_limited_prints_stats_before_cleanup(manager, tmp_path, mock
     assert "rate limited" in captured
     assert "Input: 1,103 tokens" in captured
     assert "Output: 10 tokens" in captured
+    assert not jsonl_file.exists()
 
 
 def test_result_generic_failure_retry_prints_stats(manager, tmp_path, mocker, capsys):  # SS-043
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
     manager.state.add_prompt(prompt)
-    _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=2, output_tokens=30, cache_creation=100, cache_read=200),
     ])
     result = ExecutionResult(
-        success=False, output="", error="something broke", execution_time=10.0
+        success=False,
+        output="",
+        error="something broke",
+        execution_time=10.0,
+        session_id=SESSION_ID,
     )
 
     manager._process_execution_result(prompt, result)
@@ -515,18 +523,22 @@ def test_result_generic_failure_retry_prints_stats(manager, tmp_path, mocker, ca
 
 
 def test_result_generic_failure_permanent_prints_stats(manager, tmp_path, mocker, capsys):  # SS-044
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
     prompt.max_retries = 1
     prompt.retry_count = 1
     manager.state.add_prompt(prompt)
-    _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=1, output_tokens=5, cache_creation=50, cache_read=100),
     ])
     result = ExecutionResult(
-        success=False, output="", error="something broke", execution_time=8.0
+        success=False,
+        output="",
+        error="something broke",
+        execution_time=8.0,
+        session_id=SESSION_ID,
     )
 
     manager._process_execution_result(prompt, result)
@@ -537,14 +549,13 @@ def test_result_generic_failure_permanent_prints_stats(manager, tmp_path, mocker
     assert "Output: 5 tokens" in captured
 
 
-def test_result_non_retryable_no_stats_printed(manager, tmp_path, mocker, capsys):  # SS-045
-    """Non-retryable errors should not print stats."""
-    mocker.patch("claude_code_queue.queue_manager.Path.home", return_value=tmp_path)
+def test_result_non_retryable_prints_stats(manager, tmp_path, mocker, capsys):  # SS-045
+    _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
     prompt.status = PromptStatus.EXECUTING
     manager.state.add_prompt(prompt)
-    _setup_jsonl_for_prompt(tmp_path, prompt, [
+    _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=1, output_tokens=1, cache_creation=1, cache_read=1),
     ])
     result = ExecutionResult(
@@ -553,11 +564,13 @@ def test_result_non_retryable_no_stats_printed(manager, tmp_path, mocker, capsys
         error="nested session",
         execution_time=1.0,
         is_non_retryable=True,
+        session_id=SESSION_ID,
     )
 
     manager._process_execution_result(prompt, result)
 
     captured = capsys.readouterr().out
     assert "non-retryable" in captured
-    assert "Input" not in captured
-    assert "Duration" not in captured
+    assert "Input: 3 tokens" in captured
+    assert "Output: 1 tokens" in captured
+    assert "Duration: 1s" in captured

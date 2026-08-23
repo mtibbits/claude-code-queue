@@ -11,8 +11,10 @@ Commands are exercised by patching ``sys.argv`` and calling ``main()``.
 
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -81,6 +83,20 @@ class TestNoCommand:
         with patch("sys.argv", ["claude-queue"]):
             code = main()
         assert code == 1
+
+    def test_python_module_propagates_main_return_code(self, tmp_path):
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_code_queue.cli"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 1
 
 
 # ===========================================================================
@@ -245,6 +261,22 @@ class TestAddCommand:
         prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.model == "claude-sonnet-4-6"
 
+    def test_add_model_trims_whitespace(self):
+        _, storage = self._run_add("--model", "  sonnet  ")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "sonnet"
+
+    @pytest.mark.parametrize("model", ["", "   "])
+    def test_add_rejects_blank_model(self, model):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_add("--model", model)
+        assert exc_info.value.code == 2
+
+    def test_add_rejects_option_like_model(self):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_add("--model=--dangerously-skip-permissions")
+        assert exc_info.value.code == 2
+
     def test_add_default_model_none(self):
         _, storage = self._run_add()
         prompt = storage._save_single_prompt.call_args[0][0]
@@ -386,6 +418,12 @@ class TestStatusCommand:
         self._run_status("-d", state=state)
         captured = capsys.readouterr()
         assert "xyz99999" in captured.out
+
+    def test_status_detailed_shows_model(self, capsys):
+        p = QueuedPrompt(content="fix the bug", id="abc12345", model="sonnet")
+        state = _make_state(prompts=[p])
+        self._run_status("--detailed", state=state)
+        assert "Model: sonnet" in capsys.readouterr().out
 
     def test_status_shows_rate_limit_reset_time_when_rate_limited(self, capsys):
         reset_dt = datetime(2026, 3, 1, 15, 30, 0)
@@ -594,6 +632,16 @@ class TestListCommand:
         self._run_list("--json")
         data = json.loads(capsys.readouterr().out)
         assert all("retry_count" in item and "max_retries" in item for item in data)
+
+    def test_list_json_item_has_model(self, capsys):
+        self._run_list("--json")
+        data = json.loads(capsys.readouterr().out)
+        assert all("model" in item for item in data)
+
+    def test_list_shows_model(self, capsys):
+        prompt = QueuedPrompt(id="p1", content="task", model="opus")
+        self._run_list(prompts=[prompt])
+        assert "Model: opus" in capsys.readouterr().out
 
     def test_list_empty_queue_prints_no_prompts_message(self, capsys):
         self._run_list(prompts=[])
@@ -1229,16 +1277,22 @@ class TestBatchVariables:
         assert code == 0
 
 
-# ===========================================================================
-# Cleanup Command
-# ===========================================================================
-
 class TestCleanup:
     """Tests for `claude-queue cleanup [--dry-run]`."""
 
-    def _make_artifacts(self, tmp_path, session_uuid="aaa-bbb-ccc"):
+    @pytest.fixture(autouse=True)
+    def _use_default_profile(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    def _make_artifacts(
+        self,
+        tmp_path,
+        session_uuid="00134021-1e30-4928-b9af-e92a676ab248",
+        claude_dir=None,
+    ):
         """Create fake rate-limit artifacts under tmp_path/.claude/."""
-        claude_dir = tmp_path / ".claude"
+        if claude_dir is None:
+            claude_dir = tmp_path / ".claude"
         debug_dir = claude_dir / "debug"
         projects_dir = claude_dir / "projects" / "-home-testuser-project"
         todos_dir = claude_dir / "todos"
@@ -1246,19 +1300,19 @@ class TestCleanup:
         for d in (debug_dir, projects_dir, todos_dir, telemetry_dir):
             d.mkdir(parents=True)
 
-        # Debug file with rate_limit_error content
         debug_file = debug_dir / f"{session_uuid}.txt"
-        debug_file.write_text("startup\nrate_limit_error\n")
+        debug_file.write_text(
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}\n'
+            "2026-07-08T05:20:35.897Z [DEBUG] Retrying request\n"
+        )
 
-        # Correlated JSONL
         jsonl_file = projects_dir / f"{session_uuid}.jsonl"
         jsonl_file.write_bytes(b"x" * 5000)
 
-        # Correlated todo stub
         todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
         todo_file.write_text("[]")
 
-        # Correlated telemetry file
         telemetry_file = telemetry_dir / f"1p_failed_events.{session_uuid}.other-uuid.json"
         telemetry_file.write_text('{"events": []}')
 
@@ -1295,6 +1349,34 @@ class TestCleanup:
         out = capsys.readouterr().out
         assert "Deleted 4 rate-limit artifact(s)" in out
 
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "Error: 429",
+            "Error: Error: 429",
+            "Error in non-streaming fallback: 429",
+        ],
+    )
+    def test_cleanup_matches_known_claude_429_prefixes(
+        self, tmp_path, capsys, prefix
+    ):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        debug_file.write_text(
+            f"2026-07-08T05:20:35.896Z [ERROR] {prefix} "
+            '{"type":"error","error":{"type":"rate_limit_error"}}\n'
+        )
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert not any(
+            path.exists()
+            for path in (debug_file, jsonl_file, todo_file, telemetry_file)
+        )
+        assert "Deleted 4 rate-limit artifact(s)" in capsys.readouterr().out
+
     def test_cleanup_preserves_non_rate_limited_debug(self, tmp_path, capsys):
         """Debug files without rate_limit_error are not deleted."""
         claude_dir = tmp_path / ".claude"
@@ -1315,7 +1397,6 @@ class TestCleanup:
     def test_cleanup_preserves_real_todo_file(self, tmp_path, capsys):
         """Todo files > 2 bytes are preserved even if UUID matches a rate-limited session."""
         debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
-        # Overwrite the stub with realistic todo content (> 2 bytes)
         todo_file.write_text('[{"task": "implement feature", "status": "in_progress"}]')
 
         with patch("sys.argv", ["claude-queue", "cleanup"]):
@@ -1326,7 +1407,6 @@ class TestCleanup:
         assert todo_file.exists(), "real todo file (> 2 bytes) must be preserved"
         assert not debug_file.exists()
         assert not jsonl_file.exists()
-        # 3 deleted: debug + jsonl + telemetry (todo preserved by size guard)
         assert "Deleted 3" in capsys.readouterr().out
 
     def test_cleanup_handles_empty_claude_dir(self, tmp_path, capsys):
@@ -1339,3 +1419,282 @@ class TestCleanup:
 
         assert code == 0
         assert "Deleted 0" in capsys.readouterr().out
+
+    def test_cleanup_preserves_debug_that_only_mentions_error_type(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        debug_file.write_text("The user asked what rate_limit_error means.\n")
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+        assert todo_file.exists()
+        assert telemetry_file.exists()
+
+    @pytest.mark.parametrize(
+        "quoted_text",
+        [
+            '2026-07-08T05:20:35.896Z [DEBUG] The prompt quoted "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            '2026-07-08T05:20:35.896Z [ERROR] The prompt quoted "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            'not-a-timestamp [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [INFO] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [ERROR] "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 not-json',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"message","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"overloaded_error"}}',
+        ],
+    )
+    def test_cleanup_preserves_quoted_non_error_text(self, tmp_path, quoted_text):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        debug_file.write_text(quoted_text + "\n")
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert all(
+            path.exists()
+            for path in (debug_file, jsonl_file, todo_file, telemetry_file)
+        )
+
+    @pytest.mark.parametrize("root_name", ["debug", "todos", "telemetry", "session-env"])
+    def test_cleanup_rejects_symlinked_artifact_root(self, tmp_path, root_name):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        claude_dir = tmp_path / ".claude"
+        if root_name == "session-env":
+            (claude_dir / root_name / debug_file.stem).mkdir(parents=True)
+
+        root = claude_dir / root_name
+        external_root = tmp_path / f"external-{root_name}"
+        root.rename(external_root)
+        root.symlink_to(external_root, target_is_directory=True)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert root.is_symlink()
+        assert external_root.exists()
+        assert debug_file.exists()
+
+    @pytest.mark.parametrize(
+        "artifact_name",
+        ["debug", "jsonl", "todo", "telemetry", "session-env"],
+    )
+    def test_cleanup_handles_symlinked_artifact_leaf(self, tmp_path, artifact_name):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        artifacts = {
+            "debug": debug_file,
+            "jsonl": jsonl_file,
+            "todo": todo_file,
+            "telemetry": telemetry_file,
+        }
+
+        if artifact_name == "session-env":
+            artifact = tmp_path / ".claude" / "session-env" / debug_file.stem
+            artifact.mkdir(parents=True)
+            (artifact / "state").write_text("external")
+        else:
+            artifact = artifacts[artifact_name]
+
+        external = tmp_path / f"external-{artifact_name}"
+        artifact.rename(external)
+        artifact.symlink_to(external, target_is_directory=external.is_dir())
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        if artifact_name == "debug":
+            assert code == 1
+            assert artifact.is_symlink()
+            assert jsonl_file.exists()
+        else:
+            assert code == 0
+            assert not artifact.exists()
+            assert not artifact.is_symlink()
+            assert not debug_file.exists()
+        assert external.exists()
+
+    def test_cleanup_uses_active_claude_profile(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile = tmp_path / "profile"
+        home_artifacts = self._make_artifacts(home)
+        profile_artifacts = self._make_artifacts(tmp_path, claude_dir=profile)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=home):
+                code = main()
+
+        assert code == 0
+        assert not any(path.exists() for path in profile_artifacts)
+        assert all(path.exists() for path in home_artifacts)
+
+    def test_cleanup_does_not_follow_symlinked_projects_root(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        projects_root = tmp_path / ".claude" / "projects"
+        external_root = tmp_path / "external-projects"
+        projects_root.rename(external_root)
+        projects_root.symlink_to(external_root, target_is_directory=True)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert jsonl_file.exists()
+        assert (external_root / "-home-testuser-project" / jsonl_file.name).exists()
+        assert debug_file.exists()
+        assert not todo_file.exists()
+        assert not telemetry_file.exists()
+
+        projects_root.unlink()
+        external_root.rename(projects_root)
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                retry_code = main()
+
+        assert retry_code == 0
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()
+
+    def test_cleanup_does_not_follow_symlinked_project_child(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        project_dir = jsonl_file.parent
+        external_project = tmp_path / "external-project"
+        project_dir.rename(external_project)
+        project_dir.symlink_to(external_project, target_is_directory=True)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert jsonl_file.exists()
+        assert (external_project / jsonl_file.name).exists()
+        assert debug_file.exists()
+        assert not todo_file.exists()
+        assert not telemetry_file.exists()
+
+        project_dir.unlink()
+        external_project.rename(project_dir)
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                retry_code = main()
+
+        assert retry_code == 0
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()
+
+    def test_cleanup_removes_empty_session_environment(self, tmp_path, capsys):
+        self._make_artifacts(tmp_path)
+        session_env = (
+            tmp_path
+            / ".claude"
+            / "session-env"
+            / "00134021-1e30-4928-b9af-e92a676ab248"
+        )
+        session_env.mkdir(parents=True)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert not session_env.exists()
+        assert "Deleted 5 rate-limit artifact(s)" in capsys.readouterr().out
+
+    def test_cleanup_preserves_nonempty_session_environment(self, tmp_path):
+        self._make_artifacts(tmp_path)
+        session_env = (
+            tmp_path
+            / ".claude"
+            / "session-env"
+            / "00134021-1e30-4928-b9af-e92a676ab248"
+        )
+        session_env.mkdir(parents=True)
+        marker = session_env / "state"
+        marker.write_text("active")
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert session_env.is_dir()
+        assert marker.read_text() == "active"
+
+    def test_cleanup_ignores_non_uuid_debug_file(self, tmp_path):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(
+            tmp_path,
+            session_uuid="not-a-session-uuid",
+        )
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+        assert todo_file.exists()
+        assert telemetry_file.exists()
+
+    def test_cleanup_does_not_report_missing_todo_as_error(self, tmp_path, capsys):
+        _, _, todo_file, _ = self._make_artifacts(tmp_path)
+        todo_file.unlink()
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert "Skipped" not in capsys.readouterr().out
+
+    def test_cleanup_keeps_debug_marker_when_correlated_delete_fails(
+        self,
+        tmp_path,
+        mocker,
+    ):
+        debug_file, jsonl_file, _, _ = self._make_artifacts(tmp_path)
+        original_unlink = Path.unlink
+
+        def selective_unlink(path, *args, **kwargs):
+            if path == jsonl_file:
+                raise OSError("permission denied")
+            return original_unlink(path, *args, **kwargs)
+
+        mocker.patch.object(Path, "unlink", selective_unlink)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert debug_file.exists()
+        assert jsonl_file.exists()
+
+        mocker.stopall()
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                retry_code = main()
+
+        assert retry_code == 0
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()
