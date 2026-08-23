@@ -22,7 +22,8 @@ from .batch import (
 )
 from .queue_manager import QueueManager
 from .storage import QueueStorage
-from .models import QueuedPrompt, PromptStatus
+from .models import QueuedPrompt, PromptStatus, parse_optional_model
+from .paths import claude_config_dir
 
 
 def main():
@@ -139,6 +140,13 @@ Examples:
     add_parser.add_argument(
         "--estimated-tokens", "-t", type=int, help="Estimated token usage"
     )
+    add_parser.add_argument(
+        "--model",
+        "-m",
+        type=parse_optional_model,
+        default=None,
+        help="Claude model ID (e.g. claude-haiku-4-5-20251001)",
+    )
 
     template_parser = subparsers.add_parser(
         "template", help="Create a prompt template file"
@@ -235,7 +243,8 @@ Examples:
 
     # Install skill subcommand
     install_skill_parser = subparsers.add_parser(
-        "install-skill", help="Install the Claude Code skill to ~/.claude/skills/"
+        "install-skill",
+        help="Install the Claude Code skill into the active profile's skills/ directory",
     )
     install_skill_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing skill file"
@@ -308,8 +317,8 @@ def cmd_start(args) -> int:
             stats = state.get_stats()
             print(f"Queue status: {stats['status_counts']}")
 
-    manager.start(callback=status_callback if args.verbose else None)
-    return 0
+    started = manager.start(callback=status_callback if args.verbose else None)
+    return 0 if started else 1
 
 
 def cmd_add(args) -> int:
@@ -322,6 +331,7 @@ def cmd_add(args) -> int:
         context_files=args.context_files,
         max_retries=args.max_retries,
         estimated_tokens=args.estimated_tokens,
+        model=args.model,
     )
     # Use _save_single_prompt directly rather than load_queue_state() +
     # save_queue_state(). Loading the full queue state just to append one file
@@ -395,6 +405,8 @@ def cmd_status(args) -> int:
             print(
                 f"   {prompt.content[:80]}{'...' if len(prompt.content) > 80 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             if prompt.retry_count > 0:
                 print(f"   Retries: {prompt.retry_count}/{prompt.max_retries}")
 
@@ -444,6 +456,7 @@ def cmd_list(args) -> int:
                     "status": prompt.status.value,
                     "priority": prompt.priority,
                     "working_directory": prompt.working_directory,
+                    "model": prompt.model,
                     "created_at": prompt.created_at.isoformat(),
                     "retry_count": prompt.retry_count,
                     "max_retries": prompt.max_retries,
@@ -473,6 +486,8 @@ def cmd_list(args) -> int:
             print(
                 f"   {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}"
             )
+            if prompt.model is not None:
+                print(f"   Model: {prompt.model}")
             print(f"   Created: {prompt.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
     return 0
@@ -543,6 +558,8 @@ def cmd_bank_list(args) -> int:
         print(f"   Working directory: {template['working_directory']}")
         if template['estimated_tokens']:
             print(f"   Estimated tokens: {template['estimated_tokens']}")
+        if template.get('model'):
+            print(f"   Model: {template['model']}")
         print(f"   Modified: {template['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
         print()
 
@@ -701,8 +718,12 @@ def cmd_batch_variables(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-    """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
-    dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
+    """Install the Claude Code skill into the active profile's skills/queue/SKILL.md.
+
+    The destination follows $CLAUDE_CONFIG_DIR, so each Claude Code profile gets
+    its own copy rather than every install landing in ~/.claude.
+    """
+    dest = claude_config_dir() / "skills" / "queue" / "SKILL.md"
     skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
 
     if not skill_src.exists():
@@ -740,6 +761,15 @@ def cmd_prompt_box(args) -> int:
             if os.path.exists(potential_path):
                 binary_path = potential_path
 
+        if not binary_path:
+            # Fallback: check the Cargo build output relative to this package
+            pkg_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            for profile in ("release", "debug"):
+                potential_path = os.path.join(pkg_dir, "claude-prompt-box", "target", profile, binary_name)
+                if os.path.exists(potential_path):
+                    binary_path = potential_path
+                    break
+
         if not binary_path or not os.path.exists(binary_path):
             print(
                 "Error: prompt-box binary not found.\n"
@@ -763,4 +793,4 @@ def cmd_prompt_box(args) -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

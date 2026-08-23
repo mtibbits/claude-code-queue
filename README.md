@@ -67,7 +67,7 @@ After installation, use the `claude-queue` command:
 2. **Add a quick prompt:**
 
     ```bash
-    claude-queue add "Fix the authentication bug" --priority 1
+    claude-queue add "Fix the authentication bug" --priority 1 --model claude-sonnet-4-6
     ```
 
 3. **Create a detailed prompt template:**
@@ -97,6 +97,8 @@ After installation, use the `claude-queue` command:
 claude-queue add "Implement user authentication" --priority 1 --working-dir /path/to/project
 ```
 
+Add `--model MODEL_ID` to select a Claude model for this prompt. Omit the option to use the configured default.
+
 **Template for detailed prompt:**
 
 ```bash
@@ -112,6 +114,7 @@ working_directory: .
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # Prompt Title
@@ -318,6 +321,7 @@ context_files: # Files to include as context
     - README.md
 max_retries: 3 # Maximum total execution attempts (1 = no retries, -1 = unlimited)
 estimated_tokens: 1000 # Estimated token usage (optional)
+model: claude-sonnet-4-6 # Claude model ID (optional; null uses the configured default)
 ---
 ```
 
@@ -359,6 +363,7 @@ context_files:
     - docs/auth-requirements.md
 max_retries: 2
 estimated_tokens: 2000
+model: claude-sonnet-4-6
 ---
 
 # Fix Authentication Bug

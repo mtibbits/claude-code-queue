@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 import yaml  # type: ignore
 
-from .models import QueuedPrompt, QueueState, PromptStatus
+from .models import QueuedPrompt, QueueState, PromptStatus, parse_optional_model
 
 
 class MarkdownPromptParser:
@@ -117,6 +117,7 @@ class MarkdownPromptParser:
                 max_retries=metadata.get("max_retries", 3),
                 retry_count=retry_count,
                 estimated_tokens=metadata.get("estimated_tokens"),
+                model=parse_optional_model(metadata.get("model")),
                 # R5 — Restore created_at from YAML; fall back to filesystem ctime.
                 # Using ctime alone causes created_at to drift when files are copied or
                 # their timestamps change. The YAML value is the authoritative source.
@@ -161,6 +162,8 @@ class MarkdownPromptParser:
                 metadata["context_files"] = prompt.context_files
             if prompt.estimated_tokens:
                 metadata["estimated_tokens"] = prompt.estimated_tokens
+            if prompt.model is not None:
+                metadata["model"] = prompt.model
             if prompt.last_executed:
                 metadata["last_executed"] = prompt.last_executed.isoformat()
             if prompt.rate_limited_at:
@@ -351,6 +354,11 @@ class QueueStorage:
             if prompt and prompt.id not in processed_ids:
                 prompt.status = PromptStatus.QUEUED
                 prompts.append(prompt)
+                # Dedupe within this pass too: a hand-created `{id}.md` and the
+                # canonical `{id}-{title}.md` parse to the same prompt ID. Without
+                # this, both load as separate prompts and their saves clobber each
+                # other's state (rate-limit parks, retry counts) every cycle.
+                processed_ids.add(prompt.id)
 
         return prompts
 
@@ -419,6 +427,17 @@ class QueueStorage:
             except Exception as e:
                 print(f"Error removing file {file_path}: {e}")
 
+        # Also remove a bare `{id}.md` (hand-created, no `-{title}` suffix).
+        # The parser derives the same prompt ID from it, so leaving it behind
+        # resurrects a stale copy of the prompt on every reload. Exact-name
+        # match, so the prefix-collision concern above does not apply.
+        bare_file = directory / f"{prompt_id}.md"
+        if bare_file.exists():
+            try:
+                bare_file.unlink()
+            except Exception as e:
+                print(f"Error removing file {bare_file}: {e}")
+
     @staticmethod
     def _sanitize_filename_static(text: str) -> str:
         """Sanitize text for use in filename (static version for use in parser)."""
@@ -453,6 +472,7 @@ working_directory: .
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # Prompt Title
@@ -504,6 +524,7 @@ working_directory: .
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # {safe_name.replace('-', ' ').replace('_', ' ').title()}
@@ -568,6 +589,7 @@ What should be delivered...
                     'priority': metadata.get('priority', 0),
                     'working_directory': metadata.get('working_directory', '.'),
                     'estimated_tokens': metadata.get('estimated_tokens'),
+                    'model': parse_optional_model(metadata.get('model')),
                     'modified': datetime.fromtimestamp(file_path.stat().st_mtime)
                 })
 
