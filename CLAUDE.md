@@ -155,10 +155,13 @@ prompt records decides which account it bills to.
 ### Session Usage Statistics
 After each execution, the queue prints the duration and reads token usage from
 the exact session JSONL file. `ExecutionResult.session_id` selects the file in
-the active `$CLAUDE_CONFIG_DIR` profile. The parser counts each assistant message
-ID once because Claude can store several events for one API response. It adds
-non-cached, cache-write, and cache-read tokens for the displayed input total.
-The prompt execution log keeps the detailed breakdown across all result paths.
+the prompt's canonical `claude_config_dir` profile. The parser counts each
+assistant message ID once because Claude can store several events for one API
+response. It adds non-cached, cache-write, and cache-read tokens for the displayed
+input total. A durable cumulative cursor makes every result report only usage not
+reported by an earlier attempt. Usage from a killed attempt appears with the next
+completed result. Imported sessions establish their historical usage as the
+pre-launch baseline. The prompt log keeps the breakdown across all result paths.
 
 ### Retry Logic
 - `max_retries` = total attempts (3 = initial + 2 retries; -1 = unlimited)
@@ -279,6 +282,7 @@ session_id: null         # persisted before launch; correlates retries and clean
 resume_existing_session: false # true only for resume-session jobs
 resume_message: null     # overrides the configured resume message
 claude_config_dir: null  # canonical absolute profile path
+usage_high_water: null   # cumulative usage already reported by this prompt
 ---
 ```
 

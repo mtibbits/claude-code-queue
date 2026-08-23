@@ -215,7 +215,7 @@ result lands in `~/.claude-queue/completed/` rather than back in your terminal.
 The session stays reopenable with `claude --resume <session-id>` afterwards, with
 the queue's work already in its history.
 
-After each execution, the queue displays its duration. It also displays input and output tokens when the Claude session log contains usage data.
+After each execution, the queue displays its duration. It also displays input and output tokens when the Claude session log contains usage data. Each result reports only usage not already reported by an earlier attempt. If an interrupted attempt produces usage but no result, the next completed result includes that unreported usage.
 
 Input totals include non-cached, cache-write, and cache-read tokens. The completed prompt file keeps the detailed breakdown in its execution log.
 

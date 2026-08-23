@@ -25,7 +25,12 @@ from claude_code_queue.config import (
     PROJECT_CONFIG_FILENAME,
     resolve_resume_message,
 )
-from claude_code_queue.models import ExecutionResult, PromptStatus, QueuedPrompt
+from claude_code_queue.models import (
+    ExecutionResult,
+    PromptStatus,
+    QueuedPrompt,
+    SessionStats,
+)
 from claude_code_queue.sessions import find_session
 from claude_code_queue.storage import QueueStorage
 
@@ -238,6 +243,7 @@ class TestManagerRecordsSession:
         recovered = manager.storage.load_queue_state().prompts[0]
         assert recovered.session_id == prompt.session_id
         assert recovered.session_id is not None
+        assert recovered.usage_high_water == SessionStats()
 
 
 class TestResumeSessionCommand:

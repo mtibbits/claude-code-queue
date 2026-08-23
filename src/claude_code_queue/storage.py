@@ -18,6 +18,7 @@ from .models import (
     parse_optional_model,
     parse_optional_profile_dir,
     parse_optional_session_id,
+    parse_optional_session_stats,
     parse_resume_existing_session,
 )
 
@@ -153,6 +154,9 @@ class MarkdownPromptParser:
                 claude_config_dir=parse_optional_profile_dir(
                     metadata.get("claude_config_dir")
                 ),
+                usage_high_water=parse_optional_session_stats(
+                    metadata.get("usage_high_water")
+                ),
             )
 
             return prompt
@@ -198,6 +202,8 @@ class MarkdownPromptParser:
                 metadata["claude_config_dir"] = parse_optional_profile_dir(
                     prompt.claude_config_dir
                 )
+            if prompt.usage_high_water is not None:
+                metadata["usage_high_water"] = prompt.usage_high_water.to_dict()
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("---\n")

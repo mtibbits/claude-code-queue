@@ -94,6 +94,7 @@ class QueuedPrompt:
     resume_existing_session: bool = False  # session_id came from resume-session
     resume_message: Optional[str] = None  # overrides the configured resume message
     claude_config_dir: Optional[str] = None  # which Claude Code profile — and account — to bill
+    usage_high_water: Optional["SessionStats"] = None  # cumulative usage already reported
 
     def profile_key(self) -> str:
         """Identify the Claude Code account this prompt bills to.
@@ -317,7 +318,7 @@ class QueueState:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class SessionStats:
     """Token usage statistics extracted from a session's JSONL log."""
 
@@ -335,6 +336,66 @@ class SessionStats:
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
         )
+
+    def to_dict(self) -> Dict[str, int]:
+        """Serialize the five cumulative counters stored in prompt frontmatter."""
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "api_turns": self.api_turns,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "SessionStats":
+        """Validate and load cumulative counters from an external mapping."""
+        if not isinstance(value, dict):
+            raise ValueError("usage_high_water must be a mapping or null")
+        allowed = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "api_turns",
+        }
+        if set(value) - allowed:
+            raise ValueError("usage_high_water contains unknown fields")
+        counters: Dict[str, int] = {}
+        for field_name in allowed:
+            counter = value.get(field_name, 0)
+            if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+                raise ValueError(
+                    f"usage_high_water.{field_name} must be a non-negative integer"
+                )
+            counters[field_name] = counter
+        return cls(**counters)
+
+    def delta_from(self, prior: "SessionStats") -> "SessionStats":
+        """Return unreported usage, treating a lower counter as a log reset."""
+        def delta(current: int, previous: int) -> int:
+            return current - previous if current >= previous else current
+
+        return SessionStats(
+            input_tokens=delta(self.input_tokens, prior.input_tokens),
+            output_tokens=delta(self.output_tokens, prior.output_tokens),
+            cache_creation_input_tokens=delta(
+                self.cache_creation_input_tokens,
+                prior.cache_creation_input_tokens,
+            ),
+            cache_read_input_tokens=delta(
+                self.cache_read_input_tokens,
+                prior.cache_read_input_tokens,
+            ),
+            api_turns=delta(self.api_turns, prior.api_turns),
+        )
+
+
+def parse_optional_session_stats(value: Any) -> Optional[SessionStats]:
+    """Return a validated cumulative usage cursor from YAML."""
+    if value is None:
+        return None
+    return SessionStats.from_mapping(value)
 
 
 @dataclass

@@ -329,6 +329,7 @@ class QueueManager:
             # Persist the correlation key before launching. A SIGKILL after Popen
             # can then recover the exact session instead of starting the task over.
             prompt.session_id = str(uuid.uuid4())
+        self._initialize_usage_high_water(prompt)
         prompt.status = PromptStatus.EXECUTING
         prompt.clear_retry_backoff()    # consumed; clear so it doesn't persist into .executing.md
         prompt.last_executed = datetime.now()
@@ -362,7 +363,8 @@ class QueueManager:
         if result.session_id:
             prompt.session_id = result.session_id
 
-        stats = self._extract_session_stats(prompt, result.session_id)
+        cumulative_stats = self._extract_session_stats(prompt, result.session_id)
+        stats = self._record_usage_delta(prompt, cumulative_stats)
 
         if result.success:
             # retry_not_before is already None — cleared by _execute_prompt() via clear_retry_backoff().
@@ -595,21 +597,29 @@ class QueueManager:
             return None
 
         try:
-            return self._do_extract_session_stats(session_id)
+            return self._do_extract_session_stats(session_id, prompt.profile_key())
         except Exception as e:
             prompt.add_log(f"Warning: session stats extraction failed: {e}")
             return None
 
     @staticmethod
-    def _do_extract_session_stats(session_id: str) -> Optional[SessionStats]:
-        """Read usage from one canonical session in the active Claude profile."""
+    def _do_extract_session_stats(
+        session_id: str, config_dir: Optional[str] = None
+    ) -> Optional[SessionStats]:
+        """Read cumulative usage from one canonical session in one profile."""
         try:
-            if str(uuid.UUID(session_id)) != session_id:
-                return None
-        except (ValueError, AttributeError):
+            session_id = parse_optional_session_id(session_id)
+        except ValueError:
+            return None
+        if session_id is None:
             return None
 
-        matches = list(claude_config_dir().glob(f"projects/*/{session_id}.jsonl"))
+        profile_dir = (
+            Path(config_dir).expanduser().resolve()
+            if config_dir
+            else claude_config_dir()
+        )
+        matches = list(profile_dir.glob(f"projects/*/{session_id}.jsonl"))
         if not matches:
             return None
 
@@ -670,6 +680,35 @@ class QueueManager:
             ),
             api_turns=len(usage_by_message),
         )
+
+    def _initialize_usage_high_water(self, prompt: QueuedPrompt) -> None:
+        """Persist the pre-launch cumulative usage boundary once per prompt."""
+        if prompt.session_id is None or prompt.usage_high_water is not None:
+            return
+        try:
+            prompt.usage_high_water = (
+                self._do_extract_session_stats(prompt.session_id, prompt.profile_key())
+                or SessionStats()
+            )
+        except Exception as error:
+            # Leave the cursor unset. If a later read succeeds, imported sessions
+            # establish a baseline without attributing their history to this run.
+            prompt.add_log(f"Warning: usage baseline extraction failed: {error}")
+
+    @staticmethod
+    def _record_usage_delta(
+        prompt: QueuedPrompt, cumulative: Optional[SessionStats]
+    ) -> Optional[SessionStats]:
+        """Advance the durable cursor and return usage not reported previously."""
+        if cumulative is None:
+            return None
+        prior = prompt.usage_high_water
+        prompt.usage_high_water = cumulative
+        if prior is None:
+            if prompt.resume_existing_session:
+                return None
+            prior = SessionStats()
+        return cumulative.delta_from(prior)
 
     def _format_stats_line(
         self, execution_time: float, stats: Optional[SessionStats]
