@@ -75,19 +75,18 @@ Tasks should be idempotent where possible.
 A queued job that is interrupted — a usage limit, a crash, a timeout — continues
 its conversation on the next attempt instead of starting over.
 
-- `execute_prompt()` generates a session UUID and passes `--session-id`;
-  `_process_execution_result()` records it on the prompt, and `storage.py`
-  persists it as `session_id` frontmatter.
-- Any later attempt sees `session_id` set and switches to `--resume <uuid>`,
-  sending the resume message rather than the original instruction. Re-sending the
+- The manager persists a queue-owned `session_id` before launch. A recovered
+  attempt resumes it when its exact transcript exists; otherwise it starts that
+  same reserved UUID with `--session-id`. A resumed attempt sends the resume
+  message rather than the original instruction. Re-sending the
   instruction would invite redoing finished work; context files are skipped for
   the same reason (they are already in the conversation).
 - `--resume` reuses the same session, so one prompt yields one conversation log
   however many times it is interrupted.
 - Both `--session-id` and `--resume` are feature-detected once at startup from
   `--help` (`_detect_supported_flags()`). A CLI predating either flag rejects it
-  outright, which would fail every queued prompt; without them the queue simply
-  starts fresh each attempt.
+  outright. A continuation fails without launching when `--resume` is unavailable;
+  silently starting it as a new task can repeat destructive work.
 - `claude-queue sessions` lists conversations newest first with the id
   `resume-session` needs. `sessions.py` reads only each transcript's opening
   records — the generated `aiTitle` sits around line 11, so a line and byte cap
@@ -125,6 +124,8 @@ a prompt reaches a terminal state (COMPLETED or FAILED).
 - **Correlation is exact, never heuristic.** Every path is built from the session
   UUID the queue generated, so no size or mtime guessing is involved and no other
   session can match.
+- **Imported sessions are not cleaned.** Their UUID can name artifacts created
+  before the queue owned the continuation.
 - **Config directory honours `$CLAUDE_CONFIG_DIR`** (`paths.claude_config_dir()`).
   Hardcoding `~/.claude` makes cleanup a silent no-op for anyone using a custom
   config directory, and installs skills into the wrong profile.
@@ -266,8 +267,10 @@ last_executed: null
 rate_limited_at: null
 reset_time: null
 retry_not_before: null
-session_id: null         # set after attempt 1; makes retries resume it
+session_id: null         # persisted before launch; correlates retries and cleanup
+resume_existing_session: false # true only for resume-session jobs
 resume_message: null     # overrides the configured resume message
+claude_config_dir: null  # canonical absolute profile path
 ---
 ```
 

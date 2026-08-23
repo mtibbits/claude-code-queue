@@ -64,6 +64,15 @@ class TestProfileKey:
             claude_config_dir=str(tmp_path)
         ).profile_key()
 
+    def test_path_aliases_share_one_rate_limit_key(self, tmp_path):  # PRF-004
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(profile, target_is_directory=True)
+        assert QueuedPrompt(claude_config_dir=str(profile / ".")).profile_key() == (
+            QueuedPrompt(claude_config_dir=str(alias)).profile_key()
+        )
+
 
 class TestLimitsAreScopedToTheAccount:
     def test_a_limited_account_does_not_stall_another(self, tmp_path, monkeypatch):  # PRF-010
@@ -113,12 +122,14 @@ class TestLimitsAreScopedToTheAccount:
 
 class TestExecutionBillsTheRecordedAccount:
     def test_profile_reaches_the_subprocess(self, interface, mocker, tmp_path):  # PRF-020
+        profile = tmp_path / "profile"
+        profile.mkdir()
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         interface.execute_prompt(
             QueuedPrompt(content="x", working_directory=str(tmp_path),
-                         claude_config_dir=PROFILE_A)
+                         claude_config_dir=str(profile))
         )
-        assert popen.call_args[1]["env"]["CLAUDE_CONFIG_DIR"] == PROFILE_A
+        assert popen.call_args[1]["env"]["CLAUDE_CONFIG_DIR"] == str(profile)
 
     def test_unrecorded_profile_inherits_the_processor(self, interface, mocker, tmp_path, monkeypatch):  # PRF-021
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/ambient")
@@ -127,6 +138,23 @@ class TestExecutionBillsTheRecordedAccount:
             QueuedPrompt(content="x", working_directory=str(tmp_path))
         )
         assert popen.call_args[1]["env"]["CLAUDE_CONFIG_DIR"] == "/profiles/ambient"
+
+    def test_relative_profile_is_not_rebased_to_prompt_cwd(self, interface, mocker, tmp_path, monkeypatch):  # PRF-022
+        processor_cwd = tmp_path / "processor"
+        prompt_cwd = tmp_path / "project"
+        profile = processor_cwd / "profile"
+        for path in (processor_cwd, prompt_cwd, profile):
+            path.mkdir()
+        monkeypatch.chdir(processor_cwd)
+        popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
+        interface.execute_prompt(
+            QueuedPrompt(
+                content="x",
+                working_directory=str(prompt_cwd),
+                claude_config_dir="profile",
+            )
+        )
+        assert popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(profile)
 
 
 class TestCleanupFollowsTheProfile:
@@ -183,20 +211,32 @@ class TestPersistenceAndCli:
         prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
         assert prompt.claude_config_dir == str(chosen)
 
+    def test_add_canonicalizes_a_relative_profile(self, tmp_path, monkeypatch):  # PRF-037A
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        monkeypatch.chdir(tmp_path)
+        argv = ["claude-queue", "--storage-dir", str(tmp_path / "queue"), "add", "x",
+                "--profile", "profile"]
+        with patch("sys.argv", argv):
+            assert main() == 0
+        prompt = QueueStorage(str(tmp_path / "queue")).load_queue_state().prompts[0]
+        assert prompt.claude_config_dir == str(profile)
+
     def test_resume_session_records_the_profile(self, tmp_path, monkeypatch):  # PRF-038
         profile = tmp_path / "profile"
         profile.mkdir()
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
-        argv = ["claude-queue", "--storage-dir", str(tmp_path), "resume-session", SESSION_ID]
+        argv = ["claude-queue", "--storage-dir", str(tmp_path), "resume-session", SESSION_ID,
+                "--working-dir", str(tmp_path)]
         with patch("sys.argv", argv):
             assert main() == 0
         prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
         assert prompt.claude_config_dir == str(profile)
 
-    def test_missing_profile_directory_warns(self, tmp_path, capsys):  # PRF-039
-        """A typo would otherwise surface as an auth failure when the queue runs."""
+    def test_missing_profile_directory_is_rejected(self, tmp_path, capsys):  # PRF-039
+        """A typo must not queue predictably unauthenticated work."""
         argv = ["claude-queue", "--storage-dir", str(tmp_path), "add", "x",
                 "--profile", str(tmp_path / "typo")]
         with patch("sys.argv", argv):
-            assert main() == 0
-        assert "does not exist" in capsys.readouterr().err
+            assert main() == 1
+        assert "does not exist" in capsys.readouterr().out

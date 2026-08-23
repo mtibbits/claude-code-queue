@@ -135,6 +135,23 @@ class TestArtifactRemoval:
         mocker.patch.object(Path, "unlink", flaky)
         assert QueueManager._do_cleanup_session_artifacts(SESSION_ID) == SCRATCH_COUNT - 1
 
+    def test_partial_failure_converges_when_cleanup_is_retried(self, tmp_path, monkeypatch, mocker):  # ART-016A
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        paths = _make_artifacts(tmp_path, SESSION_ID)
+        real_unlink = Path.unlink
+        failed_once = {"value": False}
+
+        def flaky(self, *args, **kwargs):
+            if self == paths["todo"] and not failed_once["value"]:
+                failed_once["value"] = True
+                raise PermissionError("locked")
+            return real_unlink(self, *args, **kwargs)
+
+        mocker.patch.object(Path, "unlink", flaky)
+        assert QueueManager._do_cleanup_session_artifacts(SESSION_ID) == SCRATCH_COUNT - 1
+        assert QueueManager._do_cleanup_session_artifacts(SESSION_ID) == 1
+        assert not paths["todo"].exists()
+
     def test_telemetry_events_are_matched_by_glob(self, tmp_path, monkeypatch):  # ART-017
         """Telemetry files carry a second, unknown UUID and multiply per attempt."""
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
@@ -171,6 +188,20 @@ class TestCleanupWrapper:
         manager._cleanup_session_artifacts(_prompt(session_id=None))
         for path in paths.values():
             assert path.exists()
+
+    def test_imported_session_artifacts_are_not_owned_by_the_queue(self, manager, tmp_path, monkeypatch):  # ART-020A
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        paths = _make_artifacts(tmp_path, SESSION_ID)
+        manager._cleanup_session_artifacts(
+            QueuedPrompt(
+                id="abc12345",
+                content="x",
+                session_id=SESSION_ID,
+                resume_existing_session=True,
+                status=PromptStatus.COMPLETED,
+            )
+        )
+        assert all(path.exists() for path in paths.values())
 
     def test_logs_removed_count(self, manager, tmp_path, monkeypatch):  # ART-021
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))

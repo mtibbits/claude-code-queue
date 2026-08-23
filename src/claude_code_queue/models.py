@@ -5,6 +5,7 @@ Data structures for Claude Code Queue system.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import uuid
 
@@ -23,6 +24,39 @@ def parse_optional_model(value: Any) -> Optional[str]:
     if model.startswith("-"):
         raise ValueError("model must not start with '-'")
     return model
+
+
+def parse_optional_session_id(value: Any) -> Optional[str]:
+    """Return a canonical optional Claude session UUID."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session_id must be a canonical UUID string or null")
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError) as error:
+        raise ValueError("session_id must be a canonical UUID string or null") from error
+    if value != canonical:
+        raise ValueError("session_id must use canonical lowercase UUID form")
+    return value
+
+
+def parse_optional_profile_dir(value: Any) -> Optional[str]:
+    """Return one canonical absolute Claude profile directory."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("claude_config_dir must be a non-empty path string or null")
+    return str(Path(value).expanduser().resolve())
+
+
+def parse_resume_existing_session(value: Any) -> bool:
+    """Return the persisted ownership flag without truthy coercion."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("resume_existing_session must be true, false, or null")
+    return value
 
 
 class PromptStatus(Enum):
@@ -56,7 +90,8 @@ class QueuedPrompt:
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
-    session_id: Optional[str] = None  # set after the first attempt; makes retries resume it
+    session_id: Optional[str] = None  # persisted before launch; owns retries and cleanup
+    resume_existing_session: bool = False  # session_id came from resume-session
     resume_message: Optional[str] = None  # overrides the configured resume message
     claude_config_dir: Optional[str] = None  # which Claude Code profile — and account — to bill
 
@@ -71,7 +106,7 @@ class QueuedPrompt:
         running under, so it resolves to that — otherwise it would look like a
         separate account and dodge a limit it actually shares.
         """
-        return self.claude_config_dir or str(_active_config_dir())
+        return parse_optional_profile_dir(self.claude_config_dir) or str(_active_config_dir())
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""

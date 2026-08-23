@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 from .paths import claude_config_dir
+from .models import parse_optional_session_id
 
 #: Stop scanning a log after this many lines. The title and working directory sit
 #: in the opening records — a median of eleven lines in — so the cap only bites on
@@ -68,7 +69,10 @@ def _first_user_text(record: Dict[str, Any]) -> Optional[str]:
     """Pull the text of a user record, whether its content is a string or blocks."""
     if record.get("isMeta"):
         return None
-    content = (record.get("message") or {}).get("content")
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -80,16 +84,25 @@ def _first_user_text(record: Dict[str, Any]) -> Optional[str]:
 
 def read_session(path: Path) -> Optional[SessionInfo]:
     """Summarise one session log, or return None when it yields nothing usable."""
+    try:
+        parse_optional_session_id(path.stem)
+    except ValueError:
+        return None
     ai_title = last_prompt = first_user = None
     project_dir = git_branch = None
     scanned_bytes = 0
 
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle):
-                scanned_bytes += len(line)
-                if index >= MAX_SCAN_LINES or scanned_bytes > MAX_SCAN_BYTES:
+        with open(path, "rb") as handle:
+            for _ in range(MAX_SCAN_LINES):
+                remaining = MAX_SCAN_BYTES - scanned_bytes
+                if remaining <= 0:
                     break
+                raw_line = handle.readline(remaining + 1)
+                if not raw_line or len(raw_line) > remaining:
+                    break
+                scanned_bytes += len(raw_line)
+                line = raw_line.decode("utf-8", errors="replace")
 
                 line = line.strip()
                 if not line:
@@ -107,8 +120,13 @@ def read_session(path: Path) -> Optional[SessionInfo]:
                 elif kind == "last-prompt":
                     last_prompt = record.get("lastPrompt")
                 elif kind == "user":
-                    project_dir = project_dir or record.get("cwd")
-                    git_branch = git_branch or record.get("gitBranch")
+                    cwd = record.get("cwd")
+                    branch = record.get("gitBranch")
+                    if isinstance(cwd, str):
+                        cwd_path = Path(cwd).expanduser()
+                        if cwd_path.is_absolute():
+                            project_dir = project_dir or str(cwd_path.resolve())
+                    git_branch = git_branch or (branch if isinstance(branch, str) else None)
                     first_user = first_user or _first_user_text(record)
 
                 # Everything worth printing is known; the rest of the transcript
@@ -147,7 +165,13 @@ def find_session(
 
     Logs are named after the session, so this is a direct glob rather than a scan.
     """
-    root = (claude_dir or claude_config_dir()) / "projects"
+    try:
+        session_id = parse_optional_session_id(session_id)
+    except ValueError:
+        return None
+    if session_id is None:
+        return None
+    root = (claude_dir or claude_config_dir()).expanduser().resolve() / "projects"
     try:
         candidates = sorted(root.glob(f"*/{session_id}.jsonl"))
     except OSError:
@@ -159,9 +183,24 @@ def find_session(
     return None
 
 
+def session_log_exists(session_id: str, claude_dir: Optional[Path] = None) -> bool:
+    """Return whether this profile has an exact log for a canonical session UUID."""
+    try:
+        session_id = parse_optional_session_id(session_id)
+    except ValueError:
+        return False
+    if session_id is None:
+        return False
+    root = (claude_dir or claude_config_dir()).expanduser().resolve() / "projects"
+    try:
+        return any(path.is_file() for path in root.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return False
+
+
 def iter_session_files(claude_dir: Optional[Path] = None) -> Iterator[Path]:
     """Yield every session log under the active profile, newest first."""
-    root = (claude_dir or claude_config_dir()) / "projects"
+    root = (claude_dir or claude_config_dir()).expanduser().resolve() / "projects"
     try:
         files = list(root.glob("*/*.jsonl"))
     except OSError:

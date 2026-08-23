@@ -401,9 +401,10 @@ Blank values fall through to the next level rather than resuming with an empty
 prompt, and a malformed config warns on stderr and falls back to the default
 instead of stopping the queue.
 
-`session_id` also appears in the frontmatter once a prompt has run. It is managed
-by the queue — it records the conversation to continue — and is not meant to be
-edited by hand.
+`session_id` appears in frontmatter before a prompt launches. It lets crash
+recovery continue the same conversation and correlates cleanup with that exact
+run. `resume_existing_session` marks jobs created by `resume-session`. The queue
+manages both fields; do not edit them by hand.
 
 ### Multiple Claude Code Profiles (Multiple Accounts)
 
@@ -541,6 +542,7 @@ context_files:
     - docs/auth-requirements.md
 max_retries: 2
 estimated_tokens: 2000
+model: claude-sonnet-4-6
 ---
 
 # Fix Authentication Bug

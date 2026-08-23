@@ -1033,3 +1033,38 @@ def test_parse_optional_datetime_date_object():  # STO-042
     result = QueueStorage._parse_optional_datetime(date(2025, 6, 1))
     assert result == dt(2025, 6, 1, 0, 0, 0)
     assert result.tzinfo is None
+
+
+def test_yaml_profile_path_is_canonicalized_at_load(tmp_path, monkeypatch):  # STO-120
+    monkeypatch.chdir(tmp_path)
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(
+        MINIMAL_FRONTMATTER.replace(
+            "---\n\n", "claude_config_dir: profile/../profile\n---\n\n"
+        )
+        + "task",
+        encoding="utf-8",
+    )
+    prompt = MarkdownPromptParser.parse_prompt_file(prompt_file)
+    assert prompt is not None
+    assert prompt.claude_config_dir == str(tmp_path / "profile")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("session_id", "../../victim"),
+        ("session_id", "abcdefab-2222-3333-4444-555555555555".upper()),
+        ("claude_config_dir", "[]"),
+        ("resume_existing_session", "yes-please"),
+    ],
+)
+def test_rejects_malformed_session_ownership_metadata(tmp_path, capsys, field, value):  # STO-121
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(
+        MINIMAL_FRONTMATTER.replace("---\n\n", f"{field}: {value}\n---\n\n")
+        + "task",
+        encoding="utf-8",
+    )
+    assert MarkdownPromptParser.parse_prompt_file(prompt_file) is None
+    assert "Error parsing prompt file" in capsys.readouterr().out

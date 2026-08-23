@@ -39,7 +39,10 @@ def load_config_file(path: Path) -> Dict[str, Any]:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        print(f"Warning: ignoring unreadable config {path}: {error}", file=sys.stderr)
         return {}
 
     try:
@@ -48,7 +51,15 @@ def load_config_file(path: Path) -> Dict[str, Any]:
         print(f"Warning: ignoring malformed config {path}: {e}", file=sys.stderr)
         return {}
 
-    return loaded if isinstance(loaded, dict) else {}
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        print(
+            f"Warning: ignoring malformed config {path}: expected a mapping",
+            file=sys.stderr,
+        )
+        return {}
+    return loaded
 
 
 def resolve_resume_message(

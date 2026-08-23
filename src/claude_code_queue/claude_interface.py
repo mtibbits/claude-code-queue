@@ -18,8 +18,16 @@ from typing import Dict, FrozenSet, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_RESUME_MESSAGE
-from .models import ExecutionResult, RateLimitInfo, QueuedPrompt, parse_optional_model
+from .models import (
+    ExecutionResult,
+    RateLimitInfo,
+    QueuedPrompt,
+    parse_optional_model,
+    parse_optional_profile_dir,
+    parse_optional_session_id,
+)
 from .paths import claude_config_dir
+from .sessions import session_log_exists
 
 
 # Rate-limit messages are written to stderr (not stdout) from this version onward.
@@ -99,6 +107,11 @@ class ClaudeCodeInterface:
     # emitting a flag the CLI may not understand.
     _supports_session_id: bool = False
     _supports_resume: bool = False
+
+    @property
+    def supports_session_id(self) -> bool:
+        """Whether the installed CLI can accept a queue-owned session UUID."""
+        return self._supports_session_id
 
     def __init__(self, claude_command: str = "claude", timeout: int = 3600,
                  skip_permissions: bool = True):
@@ -305,19 +318,65 @@ class ClaudeCodeInterface:
     ) -> ExecutionResult:
         """Execute a prompt via Claude Code CLI.
 
-        When *prompt* already carries a ``session_id``, an earlier attempt got part
-        of the way through: the run continues that conversation rather than starting
-        over, so work the interrupted attempt finished is not repeated.
+        A prompt can carry a reserved queue UUID or an existing conversation UUID.
+        The queue resumes only when the transcript exists or ownership is explicit.
+        This prevents a pre-launch retry from resuming a session that does not exist.
         *resume_message* is what gets sent in that case — the caller resolves it from
         the prompt, project, and queue configuration.
         """
         start_time = time.time()
         _was_interrupted = False
 
-        resuming = bool(prompt.session_id) and self._supports_resume
-        if resuming:
-            session_id = prompt.session_id
-        else:
+        try:
+            session_id = parse_optional_session_id(prompt.session_id)
+            profile_dir = Path(
+                parse_optional_profile_dir(prompt.claude_config_dir)
+                or str(claude_config_dir())
+            )
+        except ValueError as error:
+            return ExecutionResult(
+                success=False,
+                output="",
+                error=f"Invalid queued prompt metadata: {error}",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=None,
+            )
+        if prompt.claude_config_dir and not profile_dir.is_dir():
+            return ExecutionResult(
+                success=False,
+                output="",
+                error=f"Claude profile directory does not exist: {profile_dir}",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+
+        session_exists = bool(session_id and session_log_exists(session_id, profile_dir))
+        if session_id and not self._supports_resume and (
+            prompt.resume_existing_session or session_exists
+        ):
+            return ExecutionResult(
+                success=False,
+                output="",
+                error="Installed Claude Code does not support --resume",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+        if session_id and not session_exists and not self._supports_session_id:
+            return ExecutionResult(
+                success=False,
+                output="",
+                error="Installed Claude Code cannot preserve the queued session id",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+        resuming = bool(session_id) and self._supports_resume and (
+            prompt.resume_existing_session or session_exists
+        )
+        if session_id is None:
             # Generated up front so the run can be correlated to the exact artifact
             # files it creates (see QueueManager._cleanup_session_artifacts).
             session_id = str(uuid.uuid4()) if self._supports_session_id else None
@@ -391,7 +450,7 @@ class ClaudeCodeInterface:
             # which account the run bills to. Without it a prompt would silently
             # spend whichever account the processor happened to start under.
             if prompt.claude_config_dir:
-                subprocess_env["CLAUDE_CONFIG_DIR"] = prompt.claude_config_dir
+                subprocess_env["CLAUDE_CONFIG_DIR"] = str(profile_dir)
 
             proc = subprocess.Popen(
                 cmd,

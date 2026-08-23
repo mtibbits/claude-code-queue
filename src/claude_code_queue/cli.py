@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -24,10 +23,23 @@ from .batch import (
 )
 from .queue_manager import QueueManager
 from .storage import QueueStorage
-from .models import QueuedPrompt, PromptStatus, parse_optional_model
+from .models import (
+    QueuedPrompt,
+    PromptStatus,
+    parse_optional_model,
+    parse_optional_profile_dir,
+    parse_optional_session_id,
+)
 from .config import PROJECT_CONFIG_FILENAME, resolve_resume_message
 from .paths import claude_config_dir
 from .sessions import find_session, list_sessions
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return parsed
 
 
 def main():
@@ -146,7 +158,7 @@ Examples:
         "--search", "-s", help="Only sessions whose title contains this text",
     )
     sessions_parser.add_argument(
-        "--limit", "-n", type=int, default=20,
+        "--limit", "-n", type=_nonnegative_int, default=20,
         help="Maximum sessions to show (default: 20, 0 for no limit)",
     )
     sessions_parser.add_argument(
@@ -431,9 +443,9 @@ def _resolve_profile(explicit: Optional[str] = None) -> str:
     pays; a processor started under a different one would otherwise spend the
     wrong account's budget without saying so.
     """
-    chosen = Path(explicit).expanduser() if explicit else claude_config_dir()
+    chosen = Path(parse_optional_profile_dir(explicit) or str(claude_config_dir()))
     if not chosen.is_dir():
-        print(f"Warning: profile directory {chosen} does not exist.", file=sys.stderr)
+        raise ValueError(f"profile directory {chosen} does not exist")
     return str(chosen)
 
 
@@ -520,6 +532,7 @@ def cmd_resume_session(args) -> int:
     conversation is a normal session afterwards, so it can still be reopened with
     ``claude --resume <id>`` with the queue's work already in its history.
     """
+    session_from_environment = args.session_id is None
     session_id = args.session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not session_id:
         print(
@@ -532,8 +545,8 @@ def cmd_resume_session(args) -> int:
     # Validate now rather than letting the CLI reject it at execution time, hours
     # later, after the reset the user was waiting for.
     try:
-        uuid.UUID(session_id)
-    except (ValueError, AttributeError, TypeError):
+        session_id = parse_optional_session_id(session_id)
+    except ValueError:
         print(
             f"Error: {session_id!r} is not a valid session id (expected a UUID).",
             file=sys.stderr,
@@ -550,14 +563,23 @@ def cmd_resume_session(args) -> int:
         working_dir = str(Path(args.working_dir).expanduser().resolve())
     elif known and known.project_dir:
         working_dir = known.project_dir
-    else:
+    elif session_from_environment:
+        # Claude exports this id from the owning live conversation. Its current
+        # process directory is a stronger ownership signal than a not-yet-flushed log.
         working_dir = os.getcwd()
+    else:
+        print(
+            f"Error: no usable log for session {session_id} in profile {profile}. "
+            "Pass --working-dir only if this profile owns that session.",
+            file=sys.stderr,
+        )
+        return 1
 
     if known is None:
         print(
             f"Warning: no log for session {session_id} in this profile. It may "
-            "belong to another CLAUDE_CONFIG_DIR, in which case resuming it will "
-            "fail when the queue runs.",
+            "belong to another CLAUDE_CONFIG_DIR; the explicit working directory "
+            "will be used, but Claude Code may reject the resume.",
             file=sys.stderr,
         )
 
@@ -573,6 +595,7 @@ def cmd_resume_session(args) -> int:
         working_directory=working_dir,
         priority=args.priority,
         session_id=session_id,
+        resume_existing_session=True,
         resume_message=args.message,
         claude_config_dir=profile,
     )

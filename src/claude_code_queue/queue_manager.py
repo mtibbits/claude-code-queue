@@ -11,7 +11,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
-from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult
+from .models import (
+    QueuedPrompt,
+    QueueState,
+    PromptStatus,
+    ExecutionResult,
+    parse_optional_session_id,
+)
 from .storage import QueueStorage
 from .claude_interface import ClaudeCodeInterface
 from .config import resolve_resume_message
@@ -317,6 +323,10 @@ class QueueManager:
 
     def _execute_prompt(self, prompt: QueuedPrompt) -> None:
         """Execute a single prompt."""
+        if prompt.session_id is None and self.claude_interface.supports_session_id:
+            # Persist the correlation key before launching. A SIGKILL after Popen
+            # can then recover the exact session instead of starting the task over.
+            prompt.session_id = str(uuid.uuid4())
         prompt.status = PromptStatus.EXECUTING
         prompt.clear_retry_backoff()    # consumed; clear so it doesn't persist into .executing.md
         prompt.last_executed = datetime.now()
@@ -481,7 +491,9 @@ class QueueManager:
         causing a re-queue loop on the next start.
         """
         session_id = prompt.session_id
-        if not session_id:
+        if not session_id or prompt.resume_existing_session:
+            # An imported conversation can contain artifacts created before the
+            # queue owned it. Exact UUID matching does not prove those are ours.
             return
 
         try:
@@ -516,9 +528,10 @@ class QueueManager:
         is ever touched.
         """
         try:
-            if str(uuid.UUID(session_id)) != session_id:
-                return 0
-        except (ValueError, AttributeError, TypeError):
+            session_id = parse_optional_session_id(session_id)
+        except ValueError:
+            return 0
+        if session_id is None:
             return 0
 
         claude_dir = Path(config_dir).expanduser() if config_dir else claude_config_dir()

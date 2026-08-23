@@ -133,6 +133,10 @@ What should be delivered when done.
 | `resume_message` | Sent when continuing an interrupted attempt. Omit to use the configured default. |
 | `claude_config_dir` | Claude Code profile to bill. Set automatically from `$CLAUDE_CONFIG_DIR` at queue time. |
 
+The queue persists `session_id` before launch. Do not set it by hand. The
+`resume-session` command also sets `resume_existing_session: true` so an older
+Claude CLI cannot silently run the continuation as a new task.
+
 ### Priority Guidelines
 
 - `0` — critical / blocks other work

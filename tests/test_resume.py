@@ -92,9 +92,10 @@ class TestResumeMessageResolution:
         assert resolve_resume_message(None, None, tmp_path) == DEFAULT_RESUME_MESSAGE
         assert "malformed config" in capsys.readouterr().err
 
-    def test_non_mapping_config_is_ignored(self, tmp_path):  # RES-007
+    def test_non_mapping_config_is_ignored(self, tmp_path, capsys):  # RES-007
         (tmp_path / CONFIG_FILENAME).write_text("just a string\n")
         assert resolve_resume_message(None, None, tmp_path) == DEFAULT_RESUME_MESSAGE
+        assert "expected a mapping" in capsys.readouterr().err
 
     def test_non_string_value_is_ignored(self, tmp_path):  # RES-008
         _write_config(tmp_path / CONFIG_FILENAME, "42")
@@ -119,7 +120,8 @@ class TestInterfaceResumes:
         interface._supports_resume = True
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         prompt = QueuedPrompt(id="abc12345", content="do the thing",
-                              working_directory=str(tmp_path), session_id=SESSION_ID)
+                              working_directory=str(tmp_path), session_id=SESSION_ID,
+                              resume_existing_session=True)
         result = interface.execute_prompt(prompt, "carry on")
         cmd = popen.call_args[0][0]
         assert cmd[cmd.index("--resume") + 1] == SESSION_ID
@@ -132,7 +134,8 @@ class TestInterfaceResumes:
         interface._supports_resume = True
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         prompt = QueuedPrompt(id="abc12345", content="delete every temp file",
-                              working_directory=str(tmp_path), session_id=SESSION_ID)
+                              working_directory=str(tmp_path), session_id=SESSION_ID,
+                              resume_existing_session=True)
         interface.execute_prompt(prompt, "carry on")
         assert popen.call_args[0][0][-1] == "carry on"
 
@@ -141,7 +144,8 @@ class TestInterfaceResumes:
         interface._supports_resume = True
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         prompt = QueuedPrompt(id="abc12345", content="task",
-                              working_directory=str(tmp_path), session_id=SESSION_ID)
+                              working_directory=str(tmp_path), session_id=SESSION_ID,
+                              resume_existing_session=True)
         interface.execute_prompt(prompt)
         assert popen.call_args[0][0][-1] == DEFAULT_RESUME_MESSAGE
 
@@ -152,21 +156,52 @@ class TestInterfaceResumes:
         (tmp_path / "notes.md").write_text("x")
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         prompt = QueuedPrompt(id="abc12345", content="task", context_files=["notes.md"],
-                              working_directory=str(tmp_path), session_id=SESSION_ID)
+                              working_directory=str(tmp_path), session_id=SESSION_ID,
+                              resume_existing_session=True)
         interface.execute_prompt(prompt, "carry on")
         assert "@notes.md" not in popen.call_args[0][0][-1]
 
-    def test_old_cli_without_resume_starts_fresh(self, interface, mocker, tmp_path):  # RES-015
-        """A CLI that never advertised --resume must not be handed it."""
+    def test_old_cli_without_resume_fails_without_launching(self, interface, mocker, tmp_path):  # RES-015
+        """Never run a continuation placeholder as a fresh destructive task."""
         interface._supports_session_id = True
         interface._supports_resume = False
         popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
         prompt = QueuedPrompt(id="abc12345", content="task",
-                              working_directory=str(tmp_path), session_id=SESSION_ID)
+                              working_directory=str(tmp_path), session_id=SESSION_ID,
+                              resume_existing_session=True)
+        result = interface.execute_prompt(prompt, "carry on")
+        assert result.is_non_retryable is True
+        assert "does not support --resume" in result.error
+        popen.assert_not_called()
+
+    def test_reserved_session_id_starts_new_until_a_log_exists(self, interface, mocker, tmp_path):  # RES-016
+        interface._supports_session_id = True
+        interface._supports_resume = True
+        popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
+        prompt = QueuedPrompt(
+            content="task", working_directory=str(tmp_path), session_id=SESSION_ID
+        )
+        interface.execute_prompt(prompt)
+        cmd = popen.call_args[0][0]
+        assert cmd[cmd.index("--session-id") + 1] == SESSION_ID
+        assert "--resume" not in cmd
+
+    def test_queue_owned_session_resumes_after_its_log_exists(self, interface, mocker, tmp_path):  # RES-017
+        profile = tmp_path / "profile"
+        _write_session_log(profile, project=str(tmp_path))
+        interface._supports_session_id = True
+        interface._supports_resume = True
+        popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
+        prompt = QueuedPrompt(
+            content="task",
+            working_directory=str(tmp_path),
+            session_id=SESSION_ID,
+            claude_config_dir=str(profile),
+        )
         interface.execute_prompt(prompt, "carry on")
         cmd = popen.call_args[0][0]
-        assert "--resume" not in cmd
-        assert cmd[-1] == "task"
+        assert cmd[cmd.index("--resume") + 1] == SESSION_ID
+        assert cmd[-1] == "carry on"
 
 
 class TestManagerRecordsSession:
@@ -181,11 +216,28 @@ class TestManagerRecordsSession:
 
     def test_recorded_session_survives_a_reload(self, storage):  # RES-021
         prompt = QueuedPrompt(id="abc12345", content="task", session_id=SESSION_ID,
-                              resume_message="carry on")
+                              resume_message="carry on", resume_existing_session=True)
         storage._save_single_prompt(prompt)
         reloaded = storage.load_queue_state().prompts[0]
         assert reloaded.session_id == SESSION_ID
         assert reloaded.resume_message == "carry on"
+        assert reloaded.resume_existing_session is True
+
+    def test_session_id_is_persisted_before_launch(self, manager, mocker):  # RES-022
+        manager.claude_interface._supports_session_id = True
+        manager.state = manager.storage.load_queue_state()
+        prompt = QueuedPrompt(id="abc12345", content="task")
+        manager.state.add_prompt(prompt)
+        mocker.patch.object(
+            manager.claude_interface, "execute_prompt", side_effect=KeyboardInterrupt
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            manager._execute_prompt(prompt)
+
+        recovered = manager.storage.load_queue_state().prompts[0]
+        assert recovered.session_id == prompt.session_id
+        assert recovered.session_id is not None
 
 
 class TestResumeSessionCommand:
@@ -196,9 +248,10 @@ class TestResumeSessionCommand:
             return main()
 
     def test_queues_a_continuation(self, tmp_path):  # RES-030
-        assert self._run(tmp_path, SESSION_ID) == 0
+        assert self._run(tmp_path, SESSION_ID, "--working-dir", str(tmp_path)) == 0
         prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
         assert prompt.session_id == SESSION_ID
+        assert prompt.resume_existing_session is True
         assert prompt.status == PromptStatus.QUEUED
 
     def test_uses_the_running_session_by_default(self, tmp_path, monkeypatch):  # RES-031
@@ -217,8 +270,19 @@ class TestResumeSessionCommand:
         assert self._run(tmp_path, "not-a-uuid") == 1
         assert "not a valid session id" in capsys.readouterr().err
 
+    def test_rejects_a_noncanonical_session_id(self, tmp_path, capsys):  # RES-033A
+        assert self._run(tmp_path, "ABCDEFAB-2222-3333-4444-555555555555") == 1
+        assert "not a valid session id" in capsys.readouterr().err
+
     def test_message_flag_is_stored_on_the_prompt(self, tmp_path):  # RES-034
-        assert self._run(tmp_path, SESSION_ID, "-m", "finish the migration") == 0
+        assert self._run(
+            tmp_path,
+            SESSION_ID,
+            "-m",
+            "finish the migration",
+            "--working-dir",
+            str(tmp_path),
+        ) == 0
         prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
         assert prompt.resume_message == "finish the migration"
 
@@ -253,17 +317,18 @@ class TestResumeSessionCommand:
         prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
         assert Path(prompt.working_directory).resolve() == override.resolve()
 
-    def test_unknown_session_falls_back_and_warns(self, tmp_path, monkeypatch, capsys):  # RES-038
-        """The session may live in another profile; say so rather than pretending."""
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty-profile"))
+    def test_unknown_session_without_owned_directory_is_rejected(self, tmp_path, monkeypatch, capsys):  # RES-038
+        """Do not guess a conversation's working directory from the caller."""
+        profile = tmp_path / "empty-profile"
+        profile.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
         here = tmp_path / "here"
         here.mkdir()
         monkeypatch.chdir(here)
 
-        assert self._run(tmp_path, SESSION_ID) == 0
-        assert "no log for session" in capsys.readouterr().err
-        prompt = QueueStorage(str(tmp_path)).load_queue_state().prompts[0]
-        assert Path(prompt.working_directory).resolve() == here.resolve()
+        assert self._run(tmp_path, SESSION_ID) == 1
+        assert "no usable log" in capsys.readouterr().err
+        assert QueueStorage(str(tmp_path)).load_queue_state().prompts == []
 
     def test_shows_the_session_title(self, tmp_path, monkeypatch, capsys):  # RES-039
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "profile"))

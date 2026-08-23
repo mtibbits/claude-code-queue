@@ -9,6 +9,7 @@ Test IDs: SES-001..SES-030
 """
 
 import json
+import io
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,8 @@ import pytest
 from claude_code_queue.cli import _format_age, main
 from claude_code_queue.sessions import (
     MAX_SCAN_LINES,
+    MAX_SCAN_BYTES,
+    find_session,
     list_sessions,
     read_session,
 )
@@ -105,6 +108,40 @@ class TestReadSession:
         the cap falls back instead."""
         path = _write_log(tmp_path, ai_title="Buried title", extra_lines=MAX_SCAN_LINES + 10)
         assert read_session(path).title != "Buried title"
+
+    def test_bounds_each_jsonl_read(self, tmp_path, mocker):  # SES-012
+        path = _write_log(tmp_path)
+
+        class RecordingStream(io.BytesIO):
+            sizes = []
+
+            def readline(self, size=-1):
+                self.sizes.append(size)
+                return super().readline(size)
+
+        stream = RecordingStream(b"x" * (MAX_SCAN_BYTES + 100) + b"\n")
+        mocker.patch("builtins.open", return_value=stream)
+        assert read_session(path).title == "(untitled)"
+        assert stream.sizes == [MAX_SCAN_BYTES + 1]
+
+    @pytest.mark.parametrize("message", [True, 42, "text", ["not", "a", "mapping"]])
+    def test_malformed_message_shapes_are_ignored(self, tmp_path, message):  # SES-013
+        path = _write_log(tmp_path, ai_title=None)
+        path.write_text(
+            json.dumps({"type": "user", "message": message}) + "\n",
+            encoding="utf-8",
+        )
+        assert read_session(path).title == "(untitled)"
+
+    def test_rejects_noncanonical_log_filename(self, tmp_path):  # SES-014
+        path = _write_log(
+            tmp_path, session_id="ABCDEFAB-2222-3333-4444-555555555555"
+        )
+        assert read_session(path) is None
+
+    def test_find_session_rejects_glob_syntax(self, tmp_path):  # SES-015
+        _write_log(tmp_path)
+        assert find_session("*", tmp_path) is None
 
 
 class TestListSessions:

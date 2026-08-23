@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import List, Optional
 import yaml  # type: ignore
 
-from .models import QueuedPrompt, QueueState, PromptStatus, parse_optional_model
+from .models import (
+    QueuedPrompt,
+    QueueState,
+    PromptStatus,
+    parse_optional_model,
+    parse_optional_profile_dir,
+    parse_optional_session_id,
+    parse_resume_existing_session,
+)
 
 
 class MarkdownPromptParser:
@@ -137,9 +145,14 @@ class MarkdownPromptParser:
                 retry_not_before=QueueStorage._parse_optional_datetime(
                     metadata.get("retry_not_before")
                 ),
-                session_id=metadata.get("session_id"),
+                session_id=parse_optional_session_id(metadata.get("session_id")),
+                resume_existing_session=parse_resume_existing_session(
+                    metadata.get("resume_existing_session")
+                ),
                 resume_message=metadata.get("resume_message"),
-                claude_config_dir=metadata.get("claude_config_dir"),
+                claude_config_dir=parse_optional_profile_dir(
+                    metadata.get("claude_config_dir")
+                ),
             )
 
             return prompt
@@ -176,11 +189,15 @@ class MarkdownPromptParser:
             if prompt.retry_not_before is not None:
                 metadata["retry_not_before"] = prompt.retry_not_before.isoformat()
             if prompt.session_id:
-                metadata["session_id"] = prompt.session_id
+                metadata["session_id"] = parse_optional_session_id(prompt.session_id)
+            if prompt.resume_existing_session:
+                metadata["resume_existing_session"] = True
             if prompt.resume_message:
                 metadata["resume_message"] = prompt.resume_message
             if prompt.claude_config_dir:
-                metadata["claude_config_dir"] = prompt.claude_config_dir
+                metadata["claude_config_dir"] = parse_optional_profile_dir(
+                    prompt.claude_config_dir
+                )
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("---\n")
