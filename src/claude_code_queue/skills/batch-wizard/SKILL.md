@@ -10,6 +10,7 @@ description: >
   "batch workflow".
 argument-hint: "[project path or short description of the work]"
 disable-model-invocation: false
+allowed-tools: [Bash, Read, Glob, Grep, Write, Edit, Agent]
 ---
 
 # Batch Job Wizard
@@ -58,6 +59,10 @@ Goal: Understand what the user wants to accomplish and where.
 - Ask: What project/directory are these jobs for?
 - Ask: What is the goal? (refactor, review, documentation, tests, migration, etc.)
 - Ask: Roughly how many targets do you expect?
+- Ask: Which queue storage directory should contain the jobs?
+  Use `~/.claude-queue` only when the user has no custom directory.
+- Resolve the queue storage directory to an absolute path. Use this path for
+  every `claude-queue` command in later phases.
 - Explore the project briefly (read CLAUDE.md, scan directory structure) to
   build context for later phases.
 
@@ -124,8 +129,10 @@ Goal: Set the YAML frontmatter values for the batch.
 - Ask about or recommend:
   - `priority` / `--base-priority` / `--priority-step` — explain that
     without `--base-priority`, all jobs get the same priority and
-    execution order becomes non-deterministic.
-  - `model` — whether a specific model is needed or the default suffices.
+    execution order becomes non-deterministic. A lower number runs first.
+    Use a positive step to preserve CSV row order.
+  - `model` — use a model ID or omit it to use the configured default.
+    Do not use a value that starts with `-`.
   - `max_retries` — recommend `-1` (unlimited) for idempotent tasks,
     `3` for tasks with side effects.
   - `working_directory` — confirm the absolute path.
@@ -138,10 +145,10 @@ Goal: Set the YAML frontmatter values for the batch.
 
 Goal: Write the template and CSV, validate, and preview before committing.
 
-- Write the template to `~/.claude-queue/bank/<name>.md`
-- Write the CSV to `~/.claude-queue/bank/<name>.csv`
-- Run: `claude-queue batch validate <name> --data <csv>`
-- Run: `claude-queue batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>] --dry-run`
+- Write the template to `<storage-dir>/bank/<name>.md`.
+- Write the CSV to `<storage-dir>/bank/<name>.csv`.
+- Run: `claude-queue --storage-dir <storage-dir> batch validate <name> --data <csv>`.
+- Run: `claude-queue --storage-dir <storage-dir> batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>] --dry-run`.
 - Show the dry-run output for review.
 - Ask: Does everything look right?
 
@@ -267,11 +274,14 @@ magnitude is fine). Offer to revise the template.
 
 Goal: Final review and optional queue start.
 
-- Run: `claude-queue batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>]`
-- Run: `claude-queue status --detailed` — show what will execute.
+- Run: `claude-queue --storage-dir <storage-dir> batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>]`.
+- Run: `claude-queue --storage-dir <storage-dir> status --detailed`.
+  Show what will execute. Each generated file starts with its unique
+  eight-character job ID.
 - Report: total job count, estimated run time (based on ~1-3 min/job for
   typical prompts, longer for complex multi-file tasks), priority ordering.
 - Ask: Ready to start? Or do you want to review individual job files first?
-- If the user says go: `claude-queue start`
-- Remind the user they can monitor progress with `claude-queue status`
-  and cancel individual jobs with `claude-queue cancel <id>`.
+- If the user says go: `claude-queue --storage-dir <storage-dir> start`.
+- Remind the user they can monitor progress with
+  `claude-queue --storage-dir <storage-dir> status` and cancel a job with
+  `claude-queue --storage-dir <storage-dir> cancel <id>`.
