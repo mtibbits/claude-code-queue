@@ -5,7 +5,7 @@ Covers config-directory resolution, session-UUID correlation, and the
 ``--session-id`` plumbing that makes the correlation exact. This path deletes
 files outside the queue's own data directory, so every guard here is load-bearing.
 
-Test IDs: ART-001..ART-035
+Test IDs: ART-001..ART-037
 """
 
 from pathlib import Path
@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from claude_code_queue.claude_interface import ClaudeCodeInterface
 from claude_code_queue.models import QueuedPrompt
 from claude_code_queue.paths import claude_config_dir
 from claude_code_queue.queue_manager import QueueManager
@@ -65,6 +64,11 @@ class TestClaudeConfigDir:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         assert claude_config_dir() == tmp_path / ".claude"
 
+    def test_relative_value_is_anchored_to_the_queue_process(self, tmp_path, monkeypatch):  # ART-005
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+        assert claude_config_dir() == tmp_path / "profile"
+
 
 class TestArtifactRemoval:
     def test_removes_all_four_artifact_kinds(self, tmp_path, monkeypatch):  # ART-010
@@ -108,6 +112,32 @@ class TestArtifactRemoval:
     def test_missing_config_dir_is_not_an_error(self, tmp_path, monkeypatch):  # ART-015
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "does-not-exist"))
         assert QueueManager._do_cleanup_rate_limit_artifacts(SESSION_ID) == 0
+
+    def test_removes_empty_session_environment_directory(self, tmp_path, monkeypatch):  # ART-018A
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        session_env = tmp_path / "session-env" / SESSION_ID
+        session_env.mkdir(parents=True)
+
+        assert QueueManager._do_cleanup_rate_limit_artifacts(SESSION_ID) == 1
+        assert not session_env.exists()
+
+    def test_keeps_nonempty_session_environment_directory(self, tmp_path, monkeypatch):  # ART-018B
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        session_env = tmp_path / "session-env" / SESSION_ID
+        session_env.mkdir(parents=True)
+        (session_env / "unexpected").write_text("keep me")
+
+        assert QueueManager._do_cleanup_rate_limit_artifacts(SESSION_ID) == 0
+        assert (session_env / "unexpected").read_text() == "keep me"
+
+    def test_rejects_non_uuid_session_id(self, tmp_path, monkeypatch):  # ART-019
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        (tmp_path / "projects" / "encoded-project").mkdir(parents=True)
+        victim = tmp_path / "victim.jsonl"
+        victim.write_text("keep me")
+
+        assert QueueManager._do_cleanup_rate_limit_artifacts("../../victim") == 0
+        assert victim.read_text() == "keep me"
 
     def test_config_dir_wins_over_home_claude(self, tmp_path, monkeypatch):  # ART-016
         """Regression: cleanup hardcoded ~/.claude, so it silently deleted nothing
@@ -229,6 +259,25 @@ class TestSessionIdPlumbing:
         first = interface.execute_prompt(prompt).session_id
         second = interface.execute_prompt(prompt).session_id
         assert first != second
+
+    def test_relative_profile_is_absolute_in_subprocess_env(
+        self, interface, mocker, tmp_path, monkeypatch
+    ):  # ART-037
+        queue_cwd = tmp_path / "queue-cwd"
+        working_dir = tmp_path / "prompt-cwd"
+        queue_cwd.mkdir()
+        working_dir.mkdir()
+        monkeypatch.chdir(queue_cwd)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+        popen = mocker.patch("subprocess.Popen", return_value=_mock_proc())
+
+        interface.execute_prompt(
+            QueuedPrompt(id="abc12345", content="hi", working_directory=str(working_dir))
+        )
+
+        assert popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(
+            queue_cwd / "profile"
+        )
 
     def test_timeout_result_still_carries_session_id(self, interface, mocker, tmp_path):  # ART-034
         """A timed-out run leaves artifacts behind too; the caller needs the UUID."""

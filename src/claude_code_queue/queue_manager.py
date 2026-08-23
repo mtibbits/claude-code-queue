@@ -6,8 +6,8 @@ import os
 import sys
 import time
 import signal
+import uuid
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
 from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult
@@ -30,7 +30,6 @@ class QueueManager:
         generic_failure_retry_delay: int = 60,
     ):
         self.storage = QueueStorage(storage_dir)
-        # Guards the execution loop only; storage-only commands stay lock-free.
         self._lock = QueueLock(self.storage.base_dir)
         self.claude_interface = ClaudeCodeInterface(claude_command, timeout,
                                                     skip_permissions=skip_permissions)
@@ -82,10 +81,18 @@ class QueueManager:
             print(f"Error: {e}", file=sys.stderr)
             return False
 
+        try:
+            return self._start_locked(callback)
+        finally:
+            self._lock.release()
+
+    def _start_locked(
+        self, callback: Optional[Callable[[QueueState], None]] = None
+    ) -> bool:
+        """Run startup and processing while ``start()`` owns the queue lock."""
         is_working, message = self.claude_interface.test_connection()
         if not is_working:
             print(f"Error: {message}")
-            self._lock.release()
             return False
 
         print(f"✓ {message}")
@@ -134,6 +141,7 @@ class QueueManager:
             print("\nShutdown requested by user")
         except Exception as e:
             print(f"Error in queue processing: {e}")
+            return False
         finally:
             self._shutdown()
 
@@ -171,7 +179,6 @@ class QueueManager:
             print("✓ Queue state saved")
 
         print("Queue manager stopped")
-        self._lock.release()
 
     def _process_queue_iteration(
         self, callback: Optional[Callable[[QueueState], None]] = None
@@ -475,7 +482,7 @@ class QueueManager:
 
     @staticmethod
     def _do_cleanup_rate_limit_artifacts(session_id: str) -> int:
-        """Delete *session_id*'s artifacts; return how many files were removed.
+        """Delete *session_id*'s artifacts; return how many entries were removed.
 
         IMPORTANT: this depends on Claude Code's internal layout under the config
         directory (``projects/``, ``todos/``, ``debug/``, ``telemetry/``). That
@@ -490,15 +497,17 @@ class QueueManager:
         characters. A session UUID is unique on its own, which makes the glob both
         simpler and exact.
         """
+        try:
+            if str(uuid.UUID(session_id)) != session_id:
+                return 0
+        except (ValueError, AttributeError):
+            return 0
+
         claude_dir = claude_config_dir()
         targets = [
-            # Conversation log — parent directory name is unknown, matched by UUID.
             *claude_dir.glob(f"projects/*/{session_id}.jsonl"),
-            # Todo stub — deterministic name.
             claude_dir / "todos" / f"{session_id}-agent-{session_id}.json",
-            # Debug transcript — deterministic name.
             claude_dir / "debug" / f"{session_id}.txt",
-            # Telemetry events — trailing UUID is unknown, matched by glob.
             *claude_dir.glob(f"telemetry/1p_failed_events.{session_id}.*.json"),
         ]
 
@@ -509,6 +518,12 @@ class QueueManager:
                 deleted += 1
             except OSError:
                 pass  # never created by this run, already gone, or inaccessible
+
+        try:
+            (claude_dir / "session-env" / session_id).rmdir()
+            deleted += 1
+        except OSError:
+            pass
         return deleted
 
     def _format_duration(self, seconds: float) -> str:

@@ -18,6 +18,7 @@ from typing import Dict, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
+from .paths import claude_config_dir
 
 
 # Rate-limit messages are written to stderr (not stdout) from this version onward.
@@ -81,6 +82,13 @@ _KILL_ESCALATION_TIMEOUT_S = 3
 _DRAIN_TIMEOUT_S = 2
 
 
+def _claude_subprocess_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    if env.get("CLAUDE_CONFIG_DIR"):
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir())
+    return env
+
+
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
 
@@ -119,7 +127,7 @@ class ClaudeCodeInterface:
                 if resolved:
                     self.claude_command = resolved
 
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--version"],
                 capture_output=True,
@@ -348,7 +356,7 @@ class ClaudeCodeInterface:
             # Fix A — Strip CLAUDECODE so nested claude invocations are not blocked by the
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
 
             # Captures the interrupt flag across all exit paths — see finally block.
             _was_interrupted = False
@@ -674,7 +682,7 @@ class ClaudeCodeInterface:
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
@@ -698,7 +706,7 @@ class ClaudeCodeInterface:
     def get_available_commands(self) -> List[str]:
         """Get available Claude Code commands."""
         try:
-            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+            subprocess_env = _claude_subprocess_env()
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,

@@ -73,9 +73,10 @@ Tasks should be idempotent where possible.
 
 ### Rate-Limit Artifact Cleanup
 A rate-limited `claude --print` still writes a conversation log, a todo stub, a
-debug transcript, and telemetry events — thousands per rate-limit window, enough
-to bog down the Claude Code UI. `QueueManager._do_cleanup_rate_limit_artifacts()`
-removes them on the rate-limit path only.
+debug transcript, a session environment directory, and telemetry events. These
+artifacts can accumulate by the thousands and slow the Claude Code UI.
+`QueueManager._do_cleanup_rate_limit_artifacts()` removes them on the rate-limit
+path only.
 
 - **Correlation is exact, never heuristic.** `execute_prompt()` generates a UUID
   and passes it as `--session-id`, so every artifact path is a known name for a
@@ -91,9 +92,9 @@ removes them on the rate-limit path only.
   `.` and `_` to `-` as well as `/`, so recomputing it silently misses any project
   path containing those characters.
 - Depends on undocumented Claude Code internals (`projects/`, `todos/`, `debug/`,
-  `telemetry/`). If the layout changes, cleanup stops finding files — safe, since
-  nothing outside these session-scoped names is ever touched. Failures are logged
-  and swallowed so `save_queue_state()` always runs.
+  `session-env/`, `telemetry/`). If the layout changes, cleanup stops finding
+  entries. Nothing outside these session-scoped names is touched. Failures are
+  logged and swallowed so `save_queue_state()` always runs.
 
 ### Retry Logic
 - `max_retries` = total attempts (3 = initial + 2 retries; -1 = unlimited)
@@ -117,9 +118,9 @@ holds it.
   unlinking lets a second processor lock an orphaned inode.
 - **Scope**: only `start` locks. Storage-only commands (`add`, `status`, `list`,
   `bank`, `batch`) run freely alongside a live processor.
-- **Exit status**: `start()` returns False when it declines to start (locked, or
-  the claude CLI is unreachable); `cmd_start` maps that to exit code 1 so a
-  supervisor sees a failed start as a failure.
+- **Exit status**: `start()` returns False when it declines to start or the
+  processing loop aborts; `cmd_start` maps that to exit code 1 so a supervisor
+  sees a failed processor as a failure.
 - **Running several profiles**: give each its own `--storage-dir`.
 
 ### Signal Handling

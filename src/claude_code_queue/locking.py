@@ -3,6 +3,7 @@ Single-writer lock over a queue storage directory.
 """
 
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Optional, Union
@@ -36,7 +37,7 @@ else:
 
 
 class QueueLockError(RuntimeError):
-    """Raised when another process already holds a queue storage directory."""
+    """Raised when a queue storage directory cannot be locked safely."""
 
 
 class QueueLock:
@@ -74,11 +75,37 @@ class QueueLock:
             return
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        elif self.path.is_symlink():  # pragma: no cover - O_NOFOLLOW is available on Unix
+            raise QueueLockError(f"refusing symlinked queue lock file {self.path}")
+
+        try:
+            fd = os.open(str(self.path), flags, 0o600)
+        except OSError as e:
+            raise QueueLockError(f"cannot safely open queue lock file {self.path}: {e}") from e
+
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise QueueLockError(
+                    f"queue lock file {self.path} must be a regular file with one link"
+                )
+            if sys.platform == "win32" and info.st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+        except QueueLockError:
+            os.close(fd)
+            raise
+        except OSError as e:
+            os.close(fd)
+            raise QueueLockError(f"cannot prepare queue lock file {self.path}: {e}") from e
+
         try:
             _try_lock(fd)
         except OSError as e:
-            holder = self._read_holder()
+            holder = self._read_holder(fd)
             os.close(fd)
             raise QueueLockError(
                 f"queue storage directory {self.path.parent} is already being "
@@ -87,9 +114,15 @@ class QueueLock:
                 f"processor, or start this one with a different --storage-dir."
             ) from e
 
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())
         self._fd = fd
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError as e:
+            self.release()
+            raise QueueLockError(f"cannot initialize queue lock file {self.path}: {e}") from e
 
     def release(self) -> None:
         """Release the lock. Safe when not held, and safe to call twice."""
@@ -102,11 +135,13 @@ class QueueLock:
         except OSError:
             pass
 
-    def _read_holder(self) -> str:
+    @staticmethod
+    def _read_holder(fd: int) -> str:
         """Describe the holder for the error message; best-effort only."""
         try:
-            pid = self.path.read_text(encoding="utf-8").strip()
-        except OSError:
+            os.lseek(fd, 0, os.SEEK_SET)
+            pid = os.read(fd, 64).decode("utf-8").strip()
+        except (OSError, UnicodeError):
             pid = ""
         return f"process {pid}" if pid.isdigit() else "another process"
 

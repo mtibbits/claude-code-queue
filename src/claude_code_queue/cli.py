@@ -778,4 +778,4 @@ def cmd_prompt_box(args) -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
