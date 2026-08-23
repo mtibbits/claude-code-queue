@@ -1302,18 +1302,9 @@ class TestCleanup:
 
         debug_file = debug_dir / f"{session_uuid}.txt"
         debug_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "error": (
-                            'Error: 429 {"type":"error","error":'
-                            '{"type":"rate_limit_error"}}\n'
-                            "    at generate (/claude:1:1)"
-                        ),
-                        "timestamp": "2026-07-08T05:20:35.896Z",
-                    }
-                ]
-            )
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}\n'
+            "2026-07-08T05:20:35.897Z [DEBUG] Retrying request\n"
         )
 
         jsonl_file = projects_dir / f"{session_uuid}.jsonl"
@@ -1418,10 +1409,24 @@ class TestCleanup:
     @pytest.mark.parametrize(
         "quoted_text",
         [
-            'The prompt quoted "Error: 429 {\\"type\\":\\"error\\",'
-            '\\"error\\":{\\"type\\":\\"rate_limit_error\\"}}"',
-            '{"message":"Error: 429 {\\"type\\":\\"error\\",'
-            '\\"error\\":{\\"type\\":\\"rate_limit_error\\"}}"}',
+            '2026-07-08T05:20:35.896Z [DEBUG] The prompt quoted "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            '2026-07-08T05:20:35.896Z [ERROR] The prompt quoted "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            'not-a-timestamp [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [INFO] Error: 429 '
+            '{"type":"error","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [ERROR] "Error: 429 '
+            '{\\"type\\":\\"error\\",\\"error\\":'
+            '{\\"type\\":\\"rate_limit_error\\"}}"',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 not-json',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"message","error":{"type":"rate_limit_error"}}',
+            '2026-07-08T05:20:35.896Z [ERROR] Error: 429 '
+            '{"type":"error","error":{"type":"overloaded_error"}}',
         ],
     )
     def test_cleanup_preserves_quoted_non_error_text(self, tmp_path, quoted_text):
@@ -1437,6 +1442,66 @@ class TestCleanup:
             path.exists()
             for path in (debug_file, jsonl_file, todo_file, telemetry_file)
         )
+
+    @pytest.mark.parametrize("root_name", ["debug", "todos", "telemetry", "session-env"])
+    def test_cleanup_rejects_symlinked_artifact_root(self, tmp_path, root_name):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        claude_dir = tmp_path / ".claude"
+        if root_name == "session-env":
+            (claude_dir / root_name / debug_file.stem).mkdir(parents=True)
+
+        root = claude_dir / root_name
+        external_root = tmp_path / f"external-{root_name}"
+        root.rename(external_root)
+        root.symlink_to(external_root, target_is_directory=True)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 1
+        assert root.is_symlink()
+        assert external_root.exists()
+        assert debug_file.exists()
+
+    @pytest.mark.parametrize(
+        "artifact_name",
+        ["debug", "jsonl", "todo", "telemetry", "session-env"],
+    )
+    def test_cleanup_handles_symlinked_artifact_leaf(self, tmp_path, artifact_name):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        artifacts = {
+            "debug": debug_file,
+            "jsonl": jsonl_file,
+            "todo": todo_file,
+            "telemetry": telemetry_file,
+        }
+
+        if artifact_name == "session-env":
+            artifact = tmp_path / ".claude" / "session-env" / debug_file.stem
+            artifact.mkdir(parents=True)
+            (artifact / "state").write_text("external")
+        else:
+            artifact = artifacts[artifact_name]
+
+        external = tmp_path / f"external-{artifact_name}"
+        artifact.rename(external)
+        artifact.symlink_to(external, target_is_directory=external.is_dir())
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        if artifact_name == "debug":
+            assert code == 1
+            assert artifact.is_symlink()
+            assert jsonl_file.exists()
+        else:
+            assert code == 0
+            assert not artifact.exists()
+            assert not artifact.is_symlink()
+            assert not debug_file.exists()
+        assert external.exists()
 
     def test_cleanup_uses_active_claude_profile(self, tmp_path, monkeypatch):
         home = tmp_path / "home"

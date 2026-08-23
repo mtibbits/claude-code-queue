@@ -31,24 +31,23 @@ from .paths import claude_config_dir
 _RATE_LIMIT_PREFIX = "Error: 429"
 
 
-def _is_rate_limit_error_record(record: object) -> bool:
-    """Return whether a Claude debug record is an Anthropic 429 error."""
-    if not isinstance(record, dict):
-        return False
-    error_text = record.get("error")
-    if not isinstance(error_text, str):
-        return False
-
-    error_lines = error_text.splitlines()
-    if not error_lines:
-        return False
-    first_line = error_lines[0].strip()
-    if not first_line.startswith(_RATE_LIMIT_PREFIX):
+def _is_rate_limit_error_record(line: str) -> bool:
+    """Return whether a timestamped Claude error line is an Anthropic 429."""
+    timestamp, separator, record = line.strip().partition(" [ERROR] ")
+    if not separator:
         return False
 
     try:
-        payload = json.loads(first_line[len(_RATE_LIMIT_PREFIX):].strip())
-    except (json.JSONDecodeError, TypeError):
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+
+    if not record.startswith(_RATE_LIMIT_PREFIX):
+        return False
+
+    try:
+        payload = json.loads(record[len(_RATE_LIMIT_PREFIX):].strip())
+    except json.JSONDecodeError:
         return False
 
     if not isinstance(payload, dict) or payload.get("type") != "error":
@@ -58,14 +57,8 @@ def _is_rate_limit_error_record(record: object) -> bool:
 
 
 def _contains_rate_limit_error_record(content: str) -> bool:
-    """Return whether a Claude debug JSON document contains a real 429 record."""
-    try:
-        document = json.loads(content)
-    except json.JSONDecodeError:
-        return False
-
-    records = document if isinstance(document, list) else [document]
-    return any(_is_rate_limit_error_record(record) for record in records)
+    """Return whether a Claude debug transcript contains a real 429 record."""
+    return any(_is_rate_limit_error_record(line) for line in content.splitlines())
 
 
 def _is_non_symlink_directory(path: Path) -> bool:
@@ -814,22 +807,27 @@ def cmd_cleanup(args) -> int:
     failed_sessions: Set[str] = set()
 
     debug_dir = claude_dir / "debug"
-    if _is_non_symlink_directory(debug_dir):
+    if debug_dir.is_symlink():
+        skipped += 1
+    elif _is_non_symlink_directory(debug_dir):
         for debug_file in debug_dir.glob("*.txt"):
-            if debug_file.is_symlink():
-                continue
-            try:
-                with open(debug_file, "r", errors="replace") as fh:
-                    content = fh.read()
-            except OSError:
-                skipped += 1
-                continue
-
             try:
                 session_uuid = str(UUID(debug_file.stem))
             except ValueError:
                 continue
             if session_uuid != debug_file.stem:
+                continue
+            if debug_file.is_symlink():
+                skipped += 1
+                failed_sessions.add(session_uuid)
+                continue
+
+            try:
+                with open(debug_file, "r", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                skipped += 1
+                failed_sessions.add(session_uuid)
                 continue
 
             has_rate_limit_error = _contains_rate_limit_error_record(content)
@@ -860,11 +858,9 @@ def cmd_cleanup(args) -> int:
         for project_dir in project_dirs:
             for session_uuid in rate_limited_sessions:
                 jsonl_file = project_dir / f"{session_uuid}.jsonl"
-                if jsonl_file.is_symlink():
-                    continue
                 try:
                     if dry_run:
-                        if not jsonl_file.is_file():
+                        if not jsonl_file.is_symlink() and not jsonl_file.is_file():
                             continue
                         print(f"  [dry-run] would delete {jsonl_file}")
                     else:
@@ -877,12 +873,20 @@ def cmd_cleanup(args) -> int:
                     failed_sessions.add(session_uuid)
 
     todos_dir = claude_dir / "todos"
-    if _is_non_symlink_directory(todos_dir):
+    if todos_dir.is_symlink():
+        skipped += 1
+        failed_sessions.update(rate_limited_sessions)
+    elif _is_non_symlink_directory(todos_dir):
         for session_uuid in rate_limited_sessions:
             todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
-            if todo_file.is_symlink():
-                continue
             try:
+                if todo_file.is_symlink():
+                    if dry_run:
+                        print(f"  [dry-run] would delete {todo_file}")
+                    else:
+                        todo_file.unlink()
+                    matched += 1
+                    continue
                 st = todo_file.stat()
                 if st.st_size <= 2:
                     if dry_run:
@@ -897,11 +901,12 @@ def cmd_cleanup(args) -> int:
                 failed_sessions.add(session_uuid)
 
     telemetry_dir = claude_dir / "telemetry"
-    if _is_non_symlink_directory(telemetry_dir):
+    if telemetry_dir.is_symlink():
+        skipped += 1
+        failed_sessions.update(rate_limited_sessions)
+    elif _is_non_symlink_directory(telemetry_dir):
         for session_uuid in rate_limited_sessions:
             for f in telemetry_dir.glob(f"1p_failed_events.{session_uuid}.*.json"):
-                if f.is_symlink():
-                    continue
                 try:
                     if dry_run:
                         print(f"  [dry-run] would delete {f}")
@@ -913,9 +918,23 @@ def cmd_cleanup(args) -> int:
                     failed_sessions.add(session_uuid)
 
     session_env_root = claude_dir / "session-env"
-    if _is_non_symlink_directory(session_env_root):
+    if session_env_root.is_symlink():
+        skipped += 1
+        failed_sessions.update(rate_limited_sessions)
+    elif _is_non_symlink_directory(session_env_root):
         for session_uuid in rate_limited_sessions:
             session_env_dir = session_env_root / session_uuid
+            if session_env_dir.is_symlink():
+                try:
+                    if dry_run:
+                        print(f"  [dry-run] would delete {session_env_dir}")
+                    else:
+                        session_env_dir.unlink()
+                    matched += 1
+                except OSError:
+                    skipped += 1
+                    failed_sessions.add(session_uuid)
+                continue
             if not _is_non_symlink_directory(session_env_dir):
                 continue
             try:
