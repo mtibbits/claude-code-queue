@@ -12,7 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 from uuid import UUID
 
 from .batch import (
@@ -24,8 +24,23 @@ from .batch import (
 )
 from .queue_manager import QueueManager
 from .storage import QueueStorage
-from .models import QueuedPrompt, PromptStatus, parse_optional_model
+from .models import (
+    QueuedPrompt,
+    PromptStatus,
+    parse_optional_model,
+    parse_optional_profile_dir,
+    parse_optional_session_id,
+)
+from .config import PROJECT_CONFIG_FILENAME, resolve_resume_message
 from .paths import claude_config_dir
+from .sessions import find_session, list_sessions
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return parsed
 
 
 _RATE_LIMIT_PREFIXES = (
@@ -167,6 +182,70 @@ Examples:
         help="Do not pass --dangerously-skip-permissions to claude (requires confirmation dialogs)",
     )
 
+    sessions_parser = subparsers.add_parser(
+        "sessions",
+        help="List Claude Code sessions with their ids and titles",
+        description=(
+            "List Claude Code conversations, newest first, with the session id "
+            "`resume-session` needs. Defaults to sessions started in the current "
+            "directory."
+        ),
+    )
+    sessions_parser.add_argument(
+        "project",
+        nargs="?",
+        metavar="PROJECT",
+        help="Directory to list sessions for (default: the current directory)",
+    )
+    sessions_parser.add_argument(
+        "--all", "-a", action="store_true",
+        help="Every project, not just one directory",
+    )
+    sessions_parser.add_argument(
+        "--search", "-s", help="Only sessions whose title contains this text",
+    )
+    sessions_parser.add_argument(
+        "--limit", "-n", type=_nonnegative_int, default=20,
+        help="Maximum sessions to show (default: 20, 0 for no limit)",
+    )
+    sessions_parser.add_argument(
+        "--json", action="store_true", help="Output as JSON",
+    )
+
+    resume_parser = subparsers.add_parser(
+        "resume-session",
+        help="Queue a continuation of an existing Claude Code session",
+        description=(
+            "Queue a job that continues an existing Claude Code conversation once "
+            "the usage limit resets. With no SESSION_ID, the session Claude Code "
+            "exported as $CLAUDE_CODE_SESSION_ID is used, so this can be run from "
+            "inside the session that hit the limit."
+        ),
+    )
+    resume_parser.add_argument(
+        "session_id",
+        nargs="?",
+        metavar="SESSION_ID",
+        help="Session to continue (default: $CLAUDE_CODE_SESSION_ID)",
+    )
+    resume_parser.add_argument(
+        "--message",
+        "-m",
+        help="Message to send when continuing (default: the configured resume message)",
+    )
+    resume_parser.add_argument(
+        "--priority", "-p", type=int, default=0,
+        help="Priority (lower = higher priority)",
+    )
+    resume_parser.add_argument(
+        "--working-dir", "-d",
+        help="Directory the continuation runs in (default: the session's own)",
+    )
+    resume_parser.add_argument(
+        "--profile", metavar="DIR",
+        help="Claude Code profile (config directory) to bill (default: the active one)",
+    )
+
     add_parser = subparsers.add_parser("add", help="Add a prompt to the queue")
     add_parser.add_argument("prompt", help="The prompt text")
     add_parser.add_argument(
@@ -178,6 +257,10 @@ Examples:
     )
     add_parser.add_argument(
         "--working-dir", "-d", default=".", help="Working directory"
+    )
+    add_parser.add_argument(
+        "--profile", metavar="DIR",
+        help="Claude Code profile (config directory) to bill (default: the active one)",
     )
     add_parser.add_argument(
         "--context-files", "-f", nargs="*", default=[], help="Context files to include"
@@ -342,6 +425,10 @@ Examples:
             return cmd_bank(args)
         elif args.command == "batch":
             return cmd_batch(args)
+        elif args.command == "sessions":
+            return cmd_sessions(args)
+        elif args.command == "resume-session":
+            return cmd_resume_session(args)
         elif args.command == "install-skill":
             return cmd_install_skill(args)
         elif args.command == "cleanup":
@@ -390,6 +477,7 @@ def cmd_add(args) -> int:
         max_retries=args.max_retries,
         estimated_tokens=args.estimated_tokens,
         model=args.model,
+        claude_config_dir=_resolve_profile(args.profile),
     )
     # Use _save_single_prompt directly rather than load_queue_state() +
     # save_queue_state(). Loading the full queue state just to append one file
@@ -400,7 +488,186 @@ def cmd_add(args) -> int:
     success = storage._save_single_prompt(prompt)
     if success:
         print(f"✓ Added prompt {prompt.id} to queue")
+        print(f"  Profile: {prompt.claude_config_dir}")
     return 0 if success else 1
+
+
+def _resolve_profile(explicit: Optional[str] = None) -> str:
+    """Decide which Claude Code profile a queued prompt should bill to.
+
+    Recorded at queue time rather than left to the processor. Each config
+    directory holds its own credentials, so the profile decides which account
+    pays; a processor started under a different one would otherwise spend the
+    wrong account's budget without saying so.
+    """
+    chosen = Path(parse_optional_profile_dir(explicit) or str(claude_config_dir()))
+    if not chosen.is_dir():
+        raise ValueError(f"profile directory {chosen} does not exist")
+    return str(chosen)
+
+
+def _format_age(moment: datetime) -> str:
+    """Render how long ago *moment* was, compactly enough for a table column.
+
+    Rolls over on the units people actually read by — minutes at an hour, hours
+    at a day — and gives up on relative time after a year, where a date says more.
+    """
+    seconds = max(0, int((datetime.now() - moment).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    days = seconds // 86400
+    if days < 365:
+        return f"{days}d ago"
+    return moment.strftime("%Y-%m-%d")
+
+
+def cmd_sessions(args) -> int:
+    """List Claude Code sessions so a session id can be found without guesswork.
+
+    Scoped to the current directory by default: the question is almost always
+    "which of my sessions in this project was that one?".
+    """
+    if args.all and args.project:
+        print(
+            f"Error: --all lists every project; drop it to scope to {args.project}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    project = None if args.all else (args.project or os.getcwd())
+    if args.project and not Path(args.project).expanduser().is_dir():
+        # A warning, not an error: a project can be deleted while its transcripts
+        # remain, and listing those is a legitimate thing to want.
+        print(f"Warning: {args.project} is not a directory.", file=sys.stderr)
+
+    limit = None if args.limit == 0 else args.limit
+    found = list_sessions(project_dir=project, search=args.search, limit=limit)
+
+    if args.json:
+        print(json.dumps([s.to_dict() for s in found], indent=2, ensure_ascii=False))
+        return 0
+
+    if not found:
+        where = "any project" if args.all else f"{project}"
+        print(f"No Claude Code sessions found for {where}.")
+        if not args.all:
+            print("Use --all to list sessions from every project.")
+        return 0
+
+    ages = [_format_age(s.last_active) for s in found]
+    age_width = max([len("LAST ACTIVE")] + [len(a) for a in ages])
+    print(f"{'SESSION ID':36}  {'LAST ACTIVE'.ljust(age_width)}  TITLE")
+    for session, age in zip(found, ages):
+        title = session.title
+        if len(title) > 68:
+            title = title[:67] + "…"
+        print(f"{session.session_id:36}  {age.ljust(age_width)}  {title}")
+
+    if args.all:
+        print()
+        print("Project directories vary; pass one to narrow the list: "
+              "claude-queue sessions DIR")
+    print()
+    print("Continue one when the limit resets:")
+    print(f"  claude-queue resume-session {found[0].session_id}")
+    return 0
+
+
+def cmd_resume_session(args) -> int:
+    """Queue a continuation of an existing Claude Code session.
+
+    Claude Code exports the running session's id as $CLAUDE_CODE_SESSION_ID, so
+    this can be run from inside the session that hit the usage limit: the queue
+    picks the conversation back up at reset instead of the user having to
+    remember to.
+
+    The continuation runs non-interactively via ``claude --print --resume``. The
+    conversation is a normal session afterwards, so it can still be reopened with
+    ``claude --resume <id>`` with the queue's work already in its history.
+    """
+    session_from_environment = args.session_id is None
+    session_id = args.session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        print(
+            "Error: no session id given and $CLAUDE_CODE_SESSION_ID is not set.\n"
+            "Pass one explicitly: claude-queue resume-session <session-id>",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Validate now rather than letting the CLI reject it at execution time, hours
+    # later, after the reset the user was waiting for.
+    try:
+        session_id = parse_optional_session_id(session_id)
+    except ValueError:
+        print(
+            f"Error: {session_id!r} is not a valid session id (expected a UUID).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # A session belongs to the directory it was working in. Defaulting to the
+    # caller's directory instead would resume the conversation somewhere else
+    # entirely — wrong files, wrong repository — which is never what "continue
+    # this session" means.
+    profile = _resolve_profile(args.profile)
+    known = find_session(session_id, Path(profile))
+    if args.working_dir is not None:
+        working_dir = str(Path(args.working_dir).expanduser().resolve())
+    elif known and known.project_dir:
+        working_dir = known.project_dir
+    elif session_from_environment:
+        # Claude exports this id from the owning live conversation. Its current
+        # process directory is a stronger ownership signal than a not-yet-flushed log.
+        working_dir = os.getcwd()
+    else:
+        print(
+            f"Error: no usable log for session {session_id} in profile {profile}. "
+            "Pass --working-dir only if this profile owns that session.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if known is None:
+        print(
+            f"Warning: no log for session {session_id} in this profile. It may "
+            "belong to another CLAUDE_CONFIG_DIR; the explicit working directory "
+            "will be used, but Claude Code may reject the resume.",
+            file=sys.stderr,
+        )
+
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    prompt = QueuedPrompt(
+        content=(
+            f"Continue Claude Code session `{session_id}`.\n\n"
+            "The queue resumes this conversation when the usage limit resets. The "
+            "message it sends is the `resume_message` below, falling back to "
+            f"`{PROJECT_CONFIG_FILENAME}` in the working directory, then the "
+            "queue's `config.yaml`, then the built-in default."
+        ),
+        working_directory=working_dir,
+        priority=args.priority,
+        session_id=session_id,
+        resume_existing_session=True,
+        resume_message=args.message,
+        claude_config_dir=profile,
+    )
+
+    if not storage._save_single_prompt(prompt):
+        return 1
+
+    message = resolve_resume_message(args.message, working_dir, args.storage_dir)
+    print(f"✓ Queued continuation of session {session_id} as prompt {prompt.id}")
+    if known is not None:
+        print(f"  Session: {known.title}")
+    print(f"  Working directory: {working_dir}")
+    print(f"  Profile: {profile}")
+    print(f"  Will send: {message}")
+    return 0
 
 
 def cmd_template(args) -> int:

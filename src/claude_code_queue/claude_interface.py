@@ -14,11 +14,20 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, FrozenSet, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
-from .models import ExecutionResult, RateLimitInfo, QueuedPrompt, parse_optional_model
+from .config import DEFAULT_RESUME_MESSAGE
+from .models import (
+    ExecutionResult,
+    RateLimitInfo,
+    QueuedPrompt,
+    parse_optional_model,
+    parse_optional_profile_dir,
+    parse_optional_session_id,
+)
 from .paths import claude_config_dir
+from .sessions import session_log_exists
 
 
 # Rate-limit messages are written to stderr (not stdout) from this version onward.
@@ -92,11 +101,17 @@ def _claude_subprocess_env() -> Dict[str, str]:
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
 
-    # Whether the installed CLI accepts --session-id. _verify_claude_available()
-    # overrides this per instance; the class-level default keeps instances that
+    # Which optional flags the installed CLI accepts. _verify_claude_available()
+    # overrides these per instance; the class-level defaults keep instances that
     # bypass __init__ (and any instance whose verification was patched out) from
     # emitting a flag the CLI may not understand.
     _supports_session_id: bool = False
+    _supports_resume: bool = False
+
+    @property
+    def supports_session_id(self) -> bool:
+        """Whether the installed CLI can accept a queue-owned session UUID."""
+        return self._supports_session_id
 
     def __init__(self, claude_command: str = "claude", timeout: int = 3600,
                  skip_permissions: bool = True):
@@ -155,7 +170,9 @@ class ClaudeCodeInterface:
                         file=sys.stderr,
                     )
 
-            self._supports_session_id = self._detect_session_id_support(subprocess_env)
+            supported = self._detect_supported_flags(subprocess_env)
+            self._supports_session_id = "--session-id" in supported
+            self._supports_resume = "--resume" in supported
 
         except FileNotFoundError:
             raise RuntimeError(
@@ -164,13 +181,13 @@ class ClaudeCodeInterface:
         except subprocess.TimeoutExpired:
             raise RuntimeError("Claude Code CLI verification timed out.")
 
-    def _detect_session_id_support(self, subprocess_env: Dict[str, str]) -> bool:
-        """Return True when the installed claude CLI accepts ``--session-id``.
+    def _detect_supported_flags(self, subprocess_env: Dict[str, str]) -> FrozenSet[str]:
+        """Return the long options the installed claude CLI advertises in ``--help``.
 
-        The queue supplies its own session UUID so rate-limit artifact cleanup can
-        identify the run's files exactly rather than guessing by size and mtime.
-        A CLI that predates the flag rejects it outright, which would fail every
-        queued prompt, so the flag is only used when ``--help`` advertises it.
+        The queue supplies its own session UUID (``--session-id``) so artifact
+        cleanup can identify a run's files exactly, and continues interrupted work
+        with ``--resume``. A CLI predating either flag rejects it outright, which
+        would fail every queued prompt, so each is used only when advertised.
         """
         try:
             result = subprocess.run(
@@ -181,8 +198,10 @@ class ClaudeCodeInterface:
                 env=subprocess_env,
             )
         except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0 and "--session-id" in result.stdout
+            return frozenset()
+        if result.returncode != 0:
+            return frozenset()
+        return frozenset(re.findall(r"--[a-z][a-z0-9-]*", result.stdout))
 
     def _atexit_cleanup(self) -> None:
         """Wrapper for atexit — survives interpreter shutdown.
@@ -294,14 +313,73 @@ class ClaudeCodeInterface:
         )
         self._escalate_thread.start()
 
-    def execute_prompt(self, prompt: QueuedPrompt) -> ExecutionResult:
-        """Execute a prompt via Claude Code CLI."""
+    def execute_prompt(
+        self, prompt: QueuedPrompt, resume_message: Optional[str] = None
+    ) -> ExecutionResult:
+        """Execute a prompt via Claude Code CLI.
+
+        A prompt can carry a reserved queue UUID or an existing conversation UUID.
+        The queue resumes only when the transcript exists or ownership is explicit.
+        This prevents a pre-launch retry from resuming a session that does not exist.
+        *resume_message* is what gets sent in that case — the caller resolves it from
+        the prompt, project, and queue configuration.
+        """
         start_time = time.time()
         _was_interrupted = False
 
-        # Generated up front so a rate-limited run can be correlated to the exact
-        # artifact files it created (see QueueManager._do_cleanup_rate_limit_artifacts).
-        session_id = str(uuid.uuid4()) if self._supports_session_id else None
+        try:
+            session_id = parse_optional_session_id(prompt.session_id)
+            profile_dir = Path(
+                parse_optional_profile_dir(prompt.claude_config_dir)
+                or str(claude_config_dir())
+            )
+        except ValueError as error:
+            return ExecutionResult(
+                success=False,
+                output="",
+                error=f"Invalid queued prompt metadata: {error}",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=None,
+            )
+        if prompt.claude_config_dir and not profile_dir.is_dir():
+            return ExecutionResult(
+                success=False,
+                output="",
+                error=f"Claude profile directory does not exist: {profile_dir}",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+
+        session_exists = bool(session_id and session_log_exists(session_id, profile_dir))
+        if session_id and not self._supports_resume and (
+            prompt.resume_existing_session or session_exists
+        ):
+            return ExecutionResult(
+                success=False,
+                output="",
+                error="Installed Claude Code does not support --resume",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+        if session_id and not session_exists and not self._supports_session_id:
+            return ExecutionResult(
+                success=False,
+                output="",
+                error="Installed Claude Code cannot preserve the queued session id",
+                execution_time=time.time() - start_time,
+                is_non_retryable=True,
+                session_id=session_id,
+            )
+        resuming = bool(session_id) and self._supports_resume and (
+            prompt.resume_existing_session or session_exists
+        )
+        if session_id is None:
+            # Generated up front so the run can be correlated to the exact artifact
+            # files it creates (see QueueManager._cleanup_session_artifacts).
+            session_id = str(uuid.uuid4()) if self._supports_session_id else None
 
         try:
             working_dir = Path(prompt.working_directory).resolve()
@@ -330,24 +408,31 @@ class ClaudeCodeInterface:
             cmd = [self.claude_command, "--print"]
             if self.skip_permissions:
                 cmd.append("--dangerously-skip-permissions")
-            if session_id is not None:
+            if resuming:
+                cmd.extend(["--resume", session_id])
+            elif session_id is not None:
                 cmd.extend(["--session-id", session_id])
 
-            full_prompt = prompt.content
+            if resuming:
+                # The instruction and its context files are already in the
+                # conversation; re-sending them invites redoing finished work.
+                full_prompt = resume_message or DEFAULT_RESUME_MESSAGE
+            else:
+                full_prompt = prompt.content
 
-            if prompt.context_files:
-                context_refs = []
-                for context_file in prompt.context_files:
-                    # E1 — Resolve context paths against working_dir so the
-                    # Python-side exists() guard works correctly for relative paths.
-                    # Before E1 (os.chdir), relative paths resolved against the
-                    # changed CWD; now we must be explicit.
-                    context_path = working_dir / context_file
-                    if context_path.exists():
-                        context_refs.append(f"@{context_file}")
+                if prompt.context_files:
+                    context_refs = []
+                    for context_file in prompt.context_files:
+                        # E1 — Resolve context paths against working_dir so the
+                        # Python-side exists() guard works correctly for relative paths.
+                        # Before E1 (os.chdir), relative paths resolved against the
+                        # changed CWD; now we must be explicit.
+                        context_path = working_dir / context_file
+                        if context_path.exists():
+                            context_refs.append(f"@{context_file}")
 
-                if context_refs:
-                    full_prompt = f"{' '.join(context_refs)} {prompt.content}"
+                    if context_refs:
+                        full_prompt = f"{' '.join(context_refs)} {prompt.content}"
 
             if prompt.model is not None:
                 cmd.extend(["--model", parse_optional_model(prompt.model)])
@@ -361,6 +446,11 @@ class ClaudeCodeInterface:
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
             subprocess_env = _claude_subprocess_env()
+            # Each config directory carries its own credentials, so this decides
+            # which account the run bills to. Without it a prompt would silently
+            # spend whichever account the processor happened to start under.
+            if prompt.claude_config_dir:
+                subprocess_env["CLAUDE_CONFIG_DIR"] = str(profile_dir)
 
             proc = subprocess.Popen(
                 cmd,

@@ -5,8 +5,11 @@ Data structures for Claude Code Queue system.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import uuid
+
+from .paths import claude_config_dir as _active_config_dir
 
 
 def parse_optional_model(value: Any) -> Optional[str]:
@@ -21,6 +24,39 @@ def parse_optional_model(value: Any) -> Optional[str]:
     if model.startswith("-"):
         raise ValueError("model must not start with '-'")
     return model
+
+
+def parse_optional_session_id(value: Any) -> Optional[str]:
+    """Return a canonical optional Claude session UUID."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session_id must be a canonical UUID string or null")
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError) as error:
+        raise ValueError("session_id must be a canonical UUID string or null") from error
+    if value != canonical:
+        raise ValueError("session_id must use canonical lowercase UUID form")
+    return value
+
+
+def parse_optional_profile_dir(value: Any) -> Optional[str]:
+    """Return one canonical absolute Claude profile directory."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("claude_config_dir must be a non-empty path string or null")
+    return str(Path(value).expanduser().resolve())
+
+
+def parse_resume_existing_session(value: Any) -> bool:
+    """Return the persisted ownership flag without truthy coercion."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError("resume_existing_session must be true, false, or null")
+    return value
 
 
 class PromptStatus(Enum):
@@ -54,6 +90,24 @@ class QueuedPrompt:
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
+    session_id: Optional[str] = None  # persisted before launch; owns retries and cleanup
+    resume_existing_session: bool = False  # session_id came from resume-session
+    resume_message: Optional[str] = None  # overrides the configured resume message
+    claude_config_dir: Optional[str] = None  # which Claude Code profile — and account — to bill
+    usage_high_water: Optional["SessionStats"] = None  # cumulative usage already reported
+
+    def profile_key(self) -> str:
+        """Identify the Claude Code account this prompt bills to.
+
+        Each config directory holds its own credentials, so it stands in for the
+        account. Prompts are grouped by it because usage limits are per account:
+        one profile exhausting its window must not stall another's work.
+
+        A prompt with no recorded profile bills to whatever the processor is
+        running under, so it resolves to that — otherwise it would look like a
+        separate account and dodge a limit it actually shares.
+        """
+        return parse_optional_profile_dir(self.claude_config_dir) or str(_active_config_dir())
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""
@@ -164,19 +218,23 @@ class QueueState:
         """Get the next prompt to execute (highest priority, can execute now)."""
         now = datetime.now()
 
-        # If any prompt is actively rate-limited (reset window not yet reached),
-        # don't start new work — we're already known to be rate-limited and firing
-        # more requests would just pile up additional rate-limit hits.
-        if any(
-            p.status == PromptStatus.RATE_LIMITED and not p.should_execute_now(now)
+        # A profile whose reset window has not arrived is known to be rate-limited;
+        # firing more requests at it only piles up further hits. Limits are per
+        # account, though, so this blocks that profile alone — work billing to a
+        # different account keeps running, which is the point of queueing across
+        # several profiles.
+        blocked_profiles = {
+            p.profile_key()
             for p in self.prompts
-        ):
-            return None
+            if p.status == PromptStatus.RATE_LIMITED and not p.should_execute_now(now)
+        }
 
         executable_prompts = [
             p
             for p in self.prompts
-            if p.status == PromptStatus.QUEUED and p.should_execute_now(now)
+            if p.status == PromptStatus.QUEUED
+            and p.should_execute_now(now)
+            and p.profile_key() not in blocked_profiles
         ]
 
         if not executable_prompts:
@@ -187,6 +245,7 @@ class QueueState:
                 if p.status == PromptStatus.RATE_LIMITED
                 and p.should_execute_now(now)
                 and p.can_retry()
+                and p.profile_key() not in blocked_profiles
             ]
             if retry_prompts:
                 # Reset status for retry
@@ -259,7 +318,7 @@ class QueueState:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class SessionStats:
     """Token usage statistics extracted from a session's JSONL log."""
 
@@ -277,6 +336,66 @@ class SessionStats:
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
         )
+
+    def to_dict(self) -> Dict[str, int]:
+        """Serialize the five cumulative counters stored in prompt frontmatter."""
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "api_turns": self.api_turns,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "SessionStats":
+        """Validate and load cumulative counters from an external mapping."""
+        if not isinstance(value, dict):
+            raise ValueError("usage_high_water must be a mapping or null")
+        allowed = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "api_turns",
+        }
+        if set(value) - allowed:
+            raise ValueError("usage_high_water contains unknown fields")
+        counters: Dict[str, int] = {}
+        for field_name in allowed:
+            counter = value.get(field_name, 0)
+            if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+                raise ValueError(
+                    f"usage_high_water.{field_name} must be a non-negative integer"
+                )
+            counters[field_name] = counter
+        return cls(**counters)
+
+    def delta_from(self, prior: "SessionStats") -> "SessionStats":
+        """Return unreported usage, treating a lower counter as a log reset."""
+        def delta(current: int, previous: int) -> int:
+            return current - previous if current >= previous else current
+
+        return SessionStats(
+            input_tokens=delta(self.input_tokens, prior.input_tokens),
+            output_tokens=delta(self.output_tokens, prior.output_tokens),
+            cache_creation_input_tokens=delta(
+                self.cache_creation_input_tokens,
+                prior.cache_creation_input_tokens,
+            ),
+            cache_read_input_tokens=delta(
+                self.cache_read_input_tokens,
+                prior.cache_read_input_tokens,
+            ),
+            api_turns=delta(self.api_turns, prior.api_turns),
+        )
+
+
+def parse_optional_session_stats(value: Any) -> Optional[SessionStats]:
+    """Return a validated cumulative usage cursor from YAML."""
+    if value is None:
+        return None
+    return SessionStats.from_mapping(value)
 
 
 @dataclass
