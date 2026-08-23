@@ -93,7 +93,12 @@ def _setup_jsonl(tmp_path, lines, session_id=SESSION_ID, project="project"):
 
 def _make_stats_prompt(tmp_path):
     """Create a prompt used to capture best-effort extraction warnings."""
-    return QueuedPrompt(id="abc12345", content="test", working_directory=str(tmp_path))
+    return QueuedPrompt(
+        id="abc12345",
+        content="test",
+        working_directory=str(tmp_path),
+        claude_config_dir=str(tmp_path / "profile"),
+    )
 
 
 def _use_test_profile(mocker, tmp_path):
@@ -277,8 +282,11 @@ def test_extract_stats_directory_missing(manager, tmp_path, mocker):  # SS-017
 
 
 def test_extract_stats_uses_active_profile(manager, tmp_path, mocker):  # SS-018
-    _use_test_profile(mocker, tmp_path)
-    prompt = _make_stats_prompt(tmp_path)
+    mocker.patch(
+        "claude_code_queue.models._active_config_dir",
+        return_value=tmp_path / "profile",
+    )
+    prompt = QueuedPrompt(id="abc12345", content="test")
     _setup_jsonl(tmp_path, [
         _make_assistant_line(input_tokens=1, output_tokens=2, cache_creation=3, cache_read=4),
     ])
@@ -287,6 +295,28 @@ def test_extract_stats_uses_active_profile(manager, tmp_path, mocker):  # SS-018
 
     assert stats is not None
     assert stats.total_input_tokens == 8
+
+
+def test_extract_stats_uses_prompt_profile_with_colliding_uuid(manager, tmp_path):  # SS-018A
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_jsonl(
+        profile_a / "projects" / "project" / f"{SESSION_ID}.jsonl",
+        [_make_assistant_line(input_tokens=999, output_tokens=999)],
+    )
+    _write_jsonl(
+        profile_b / "projects" / "project" / f"{SESSION_ID}.jsonl",
+        [_make_assistant_line(input_tokens=7, output_tokens=11)],
+    )
+    prompt = QueuedPrompt(
+        content="test", session_id=SESSION_ID, claude_config_dir=str(profile_b)
+    )
+
+    stats = manager._extract_session_stats(prompt, SESSION_ID)
+
+    assert stats is not None
+    assert stats.input_tokens == 7
+    assert stats.output_tokens == 11
 
 
 @pytest.mark.parametrize("session_id", [None, "", "../../victim", "NOT-A-UUID"])
@@ -345,6 +375,138 @@ def test_extract_stats_exception_returns_none(manager, tmp_path):  # SS-021
         stats = manager._extract_session_stats(prompt, SESSION_ID)
     assert stats is None
     assert "session stats extraction failed" in prompt.execution_log
+
+
+def test_two_attempts_report_only_new_usage(manager, tmp_path):  # SS-022
+    prompt = _make_stats_prompt(tmp_path)
+    prompt.usage_high_water = SessionStats()
+    session_file = _setup_jsonl(
+        tmp_path,
+        [_make_assistant_line(input_tokens=5, output_tokens=10, message_id="attempt-1")],
+    )
+
+    first = manager._record_usage_delta(
+        prompt, manager._extract_session_stats(prompt, SESSION_ID)
+    )
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _make_assistant_line(
+                input_tokens=2, output_tokens=4, message_id="attempt-2"
+            )
+            + "\n"
+        )
+    second = manager._record_usage_delta(
+        prompt, manager._extract_session_stats(prompt, SESSION_ID)
+    )
+
+    assert first == SessionStats(
+        input_tokens=5,
+        output_tokens=10,
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=200,
+        api_turns=1,
+    )
+    assert second == SessionStats(
+        input_tokens=2,
+        output_tokens=4,
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=200,
+        api_turns=1,
+    )
+
+
+def test_persisted_baseline_reports_unreported_killed_and_resumed_usage(
+    manager, tmp_path
+):  # SS-023
+    prompt = _make_stats_prompt(tmp_path)
+    prompt.session_id = SESSION_ID
+    prompt.usage_high_water = SessionStats()
+    manager.storage._save_single_prompt(prompt)
+    recovered = manager.storage.load_queue_state().prompts[0]
+    session_file = _setup_jsonl(
+        tmp_path,
+        [_make_assistant_line(input_tokens=3, output_tokens=6, message_id="killed")],
+    )
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _make_assistant_line(
+                input_tokens=4, output_tokens=8, message_id="resumed"
+            )
+            + "\n"
+        )
+
+    delta = manager._record_usage_delta(
+        recovered, manager._extract_session_stats(recovered, SESSION_ID)
+    )
+
+    assert delta is not None
+    assert delta.input_tokens == 7
+    assert delta.output_tokens == 14
+    assert delta.api_turns == 2
+
+
+def test_imported_session_snapshots_history_before_launch(manager, tmp_path):  # SS-024
+    prompt = _make_stats_prompt(tmp_path)
+    prompt.session_id = SESSION_ID
+    prompt.resume_existing_session = True
+    session_file = _setup_jsonl(
+        tmp_path,
+        [_make_assistant_line(input_tokens=100, output_tokens=200, message_id="history")],
+    )
+    manager._initialize_usage_high_water(prompt)
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _make_assistant_line(input_tokens=3, output_tokens=5, message_id="queued")
+            + "\n"
+        )
+
+    delta = manager._record_usage_delta(
+        prompt, manager._extract_session_stats(prompt, SESSION_ID)
+    )
+
+    assert delta is not None
+    assert delta.input_tokens == 3
+    assert delta.output_tokens == 5
+    assert delta.api_turns == 1
+
+
+def test_imported_session_baseline_is_persisted_before_popen(
+    manager, tmp_path, mocker
+):  # SS-024A
+    manager.state = manager.storage.load_queue_state()
+    prompt = _make_stats_prompt(tmp_path)
+    prompt.session_id = SESSION_ID
+    prompt.resume_existing_session = True
+    manager.state.add_prompt(prompt)
+    _setup_jsonl(
+        tmp_path,
+        [_make_assistant_line(input_tokens=100, output_tokens=200, message_id="history")],
+    )
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt", side_effect=KeyboardInterrupt
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        manager._execute_prompt(prompt)
+
+    recovered = manager.storage.load_queue_state().prompts[0]
+    assert recovered.usage_high_water == SessionStats(
+        input_tokens=100,
+        output_tokens=200,
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=200,
+        api_turns=1,
+    )
+
+
+def test_counter_regression_resets_that_counter(manager):  # SS-025
+    prompt = QueuedPrompt(
+        usage_high_water=SessionStats(input_tokens=100, output_tokens=80, api_turns=5)
+    )
+    current = SessionStats(input_tokens=7, output_tokens=9, api_turns=1)
+
+    assert manager._record_usage_delta(prompt, current) == current
+    assert prompt.usage_high_water == current
 
 
 # ===========================================================================
@@ -464,8 +626,8 @@ def test_result_success_no_jsonl_prints_duration_only(manager, tmp_path, mocker,
     assert "Input" not in captured
 
 
-def test_result_rate_limited_prints_stats_before_cleanup(manager, tmp_path, mocker, capsys):  # SS-042
-    """Stats must be extracted BEFORE cleanup deletes the JSONL."""
+def test_result_rate_limited_prints_stats_and_keeps_resume_log(manager, tmp_path, mocker, capsys):  # SS-042
+    """A rate-limited prompt needs both usage output and its resumable transcript."""
     _use_test_profile(mocker, tmp_path)
     manager.state = manager.storage.load_queue_state()
     prompt = _make_stats_prompt(tmp_path)
@@ -494,7 +656,7 @@ def test_result_rate_limited_prints_stats_before_cleanup(manager, tmp_path, mock
     assert "rate limited" in captured
     assert "Input: 1,103 tokens" in captured
     assert "Output: 10 tokens" in captured
-    assert not jsonl_file.exists()
+    assert jsonl_file.exists()
 
 
 def test_result_generic_failure_retry_prints_stats(manager, tmp_path, mocker, capsys):  # SS-043
@@ -574,3 +736,39 @@ def test_result_non_retryable_prints_stats(manager, tmp_path, mocker, capsys):  
     assert "Input: 3 tokens" in captured
     assert "Output: 1 tokens" in captured
     assert "Duration: 1s" in captured
+
+
+def test_result_logs_are_additive_across_rate_limit_retry(manager, tmp_path):  # SS-046
+    manager.state = manager.storage.load_queue_state()
+    prompt = _make_stats_prompt(tmp_path)
+    prompt.session_id = SESSION_ID
+    prompt.usage_high_water = SessionStats()
+    prompt.status = PromptStatus.EXECUTING
+    manager.state.add_prompt(prompt)
+    session_file = _setup_jsonl(
+        tmp_path,
+        [_make_assistant_line(input_tokens=5, output_tokens=10, message_id="first")],
+    )
+    manager._process_execution_result(
+        prompt,
+        ExecutionResult(
+            success=False,
+            output="",
+            rate_limit_info=RateLimitInfo(is_rate_limited=True),
+            session_id=SESSION_ID,
+        ),
+    )
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _make_assistant_line(input_tokens=2, output_tokens=4, message_id="second")
+            + "\n"
+        )
+    prompt.status = PromptStatus.EXECUTING
+    manager._process_execution_result(
+        prompt,
+        ExecutionResult(success=True, output="done", session_id=SESSION_ID),
+    )
+
+    assert "Token usage: 5 input" in prompt.execution_log
+    assert "Token usage: 2 input" in prompt.execution_log
+    assert "Token usage: 7 input" not in prompt.execution_log

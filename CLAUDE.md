@@ -71,38 +71,97 @@ Tasks should be idempotent where possible.
 3. **Reset time**: parsed from `usage limit reached|<unix_ts>`, ISO timestamps, or estimated from 5-hour UTC boundaries (00, 05, 10, 15, 20)
 4. **Cap**: max 24 hours into the future (SC4 — prevents queue stall)
 
-### Rate-Limit Artifact Cleanup
-A rate-limited `claude --print` still writes a conversation log, a todo stub, a
-debug transcript, a session environment directory, and telemetry events. These
-artifacts can accumulate by the thousands and slow the Claude Code UI.
-`QueueManager._do_cleanup_rate_limit_artifacts()` removes them on the rate-limit
-path only.
+### Resuming Interrupted Work
+A queued job that is interrupted — a usage limit, a crash, a timeout — continues
+its conversation on the next attempt instead of starting over.
 
-- **Correlation is exact, never heuristic.** `execute_prompt()` generates a UUID
-  and passes it as `--session-id`, so every artifact path is a known name for a
-  file this run created. When the UUID is unavailable the cleanup does nothing —
-  identifying files by size/mtime risks deleting an unrelated session's history.
-- **`--session-id` is feature-detected** once at startup (`--help` scan). Older
-  CLIs reject the unknown flag, which would fail every queued prompt.
-- **Config directory honours `$CLAUDE_CONFIG_DIR`**, falling back to `~/.claude`
-  (`claude_config_dir()`). Hardcoding `~/.claude` makes cleanup a silent no-op
-  for anyone using a custom config directory.
-- **The conversation log is found via `projects/*/<uuid>.jsonl`**, not by
-  rebuilding Claude Code's encoded project-directory name. That encoding rewrites
-  `.` and `_` to `-` as well as `/`, so recomputing it silently misses any project
-  path containing those characters.
-- Depends on undocumented Claude Code internals (`projects/`, `todos/`, `debug/`,
-  `session-env/`, `telemetry/`). If the layout changes, cleanup stops finding
-  entries. Nothing outside these session-scoped names is touched. Failures are
-  logged and swallowed so `save_queue_state()` always runs.
+- The manager persists a queue-owned `session_id` before launch. A recovered
+  attempt resumes it when its exact transcript exists; otherwise it starts that
+  same reserved UUID with `--session-id`. A resumed attempt sends the resume
+  message rather than the original instruction. Re-sending the
+  instruction would invite redoing finished work; context files are skipped for
+  the same reason (they are already in the conversation).
+- `--resume` reuses the same session, so one prompt yields one conversation log
+  however many times it is interrupted.
+- Both `--session-id` and `--resume` are feature-detected once at startup from
+  `--help` (`_detect_supported_flags()`). A CLI predating either flag rejects it
+  outright. A continuation fails without launching when `--resume` is unavailable;
+  silently starting it as a new task can repeat destructive work.
+- `claude-queue sessions` lists conversations newest first with the id
+  `resume-session` needs. `sessions.py` reads only each transcript's opening
+  records — the generated `aiTitle` sits around line 11, so a line and byte cap
+  with an early exit keeps a listing from reading hundreds of megabytes. Project
+  filtering matches the `cwd` recorded inside the log rather than decoding Claude
+  Code's directory name, which rewrites `.` and `_` as well as `/`.
+- `claude-queue resume-session [SESSION_ID]` queues a continuation of an existing
+  conversation, defaulting to `$CLAUDE_CODE_SESSION_ID` so it can be run from
+  inside the session that hit the limit. The continuation runs in the directory
+  the session itself recorded, not the caller's — resuming a conversation
+  somewhere else would point it at the wrong files. `-d` overrides that. The continuation runs non-interactively
+  via `--print`; the session stays reopenable with `claude --resume <id>`.
+
+### Resume Message Resolution
+`config.resolve_resume_message()`, most specific first:
+
+1. the prompt's `resume_message` frontmatter
+2. `.claude-queue.yaml` in the prompt's working directory (project)
+3. `config.yaml` in the storage directory (queue-wide, so per-profile)
+4. `config.DEFAULT_RESUME_MESSAGE`
+
+Blank and non-string values count as unset and fall through, so clearing a field
+never resumes with an empty prompt. A malformed config warns on stderr and falls
+back — a daemon that refuses to start over a stray tab in YAML is worse than one
+running on defaults.
+
+### Session Artifact Cleanup
+Each run leaves a todo stub, a debug transcript, and telemetry events under the
+Claude Code config directory. `_do_cleanup_session_artifacts()` removes them when
+a prompt reaches a terminal state (COMPLETED or FAILED).
+
+- **The conversation log is kept.** While the prompt is retryable it is the state
+  `--resume` continues from; afterwards it is the record of what the run did.
+  Because retries resume, logs no longer accumulate per attempt.
+- **Correlation is exact, never heuristic.** Every path is built from the session
+  UUID the queue generated, so no size or mtime guessing is involved and no other
+  session can match.
+- **Imported sessions are not cleaned.** Their UUID can name artifacts created
+  before the queue owned the continuation.
+- **Config directory honours `$CLAUDE_CONFIG_DIR`** (`paths.claude_config_dir()`).
+  Hardcoding `~/.claude` makes cleanup a silent no-op for anyone using a custom
+  config directory, and installs skills into the wrong profile.
+- Depends on undocumented Claude Code internals (`todos/`, `debug/`,
+  `telemetry/`). If the layout changes, cleanup stops finding files — safe, since
+  nothing outside these session-scoped names is ever touched. Failures are logged
+  and swallowed so `save_queue_state()` always runs.
+
+### Per-Prompt Profiles and Per-Account Limits
+Each Claude Code config directory carries its own credentials, so the profile a
+prompt records decides which account it bills to.
+
+- `QueuedPrompt.claude_config_dir` is persisted in frontmatter and set at queue
+  time by `cli._resolve_profile()` — the active `$CLAUDE_CONFIG_DIR` unless
+  `--profile` overrides it. `execute_prompt()` puts it in the subprocess
+  environment; without it a prompt silently spends whichever account the
+  processor started under.
+- `QueuedPrompt.profile_key()` resolves an unset value to the active config
+  directory, so a prompt queued before profiles existed groups with the account
+  it actually bills to rather than looking like a separate one.
+- **Usage limits are per account**, so `QueueState.get_next_prompt()` blocks only
+  the profiles whose reset window has not arrived. Work billed to another account
+  keeps running — the reason for queueing across profiles at all.
+- Artifact cleanup targets the prompt's profile, which is not necessarily the
+  processor's.
 
 ### Session Usage Statistics
 After each execution, the queue prints the duration and reads token usage from
 the exact session JSONL file. `ExecutionResult.session_id` selects the file in
-the active `$CLAUDE_CONFIG_DIR` profile. The parser counts each assistant message
-ID once because Claude can store several events for one API response. It adds
-non-cached, cache-write, and cache-read tokens for the displayed input total.
-The prompt execution log keeps the detailed breakdown across all result paths.
+the prompt's canonical `claude_config_dir` profile. The parser counts each
+assistant message ID once because Claude can store several events for one API
+response. It adds non-cached, cache-write, and cache-read tokens for the displayed
+input total. A durable cumulative cursor makes every result report only usage not
+reported by an earlier attempt. Usage from a killed attempt appears with the next
+completed result. Imported sessions establish their historical usage as the
+pre-launch baseline. The prompt log keeps the breakdown across all result paths.
 
 ### Retry Logic
 - `max_retries` = total attempts (3 = initial + 2 retries; -1 = unlimited)
@@ -126,9 +185,9 @@ holds it.
   unlinking lets a second processor lock an orphaned inode.
 - **Scope**: only `start` locks. Storage-only commands (`add`, `status`, `list`,
   `bank`, `batch`) run freely alongside a live processor.
-- **Exit status**: `start()` returns False when it declines to start or the
-  processing loop aborts; `cmd_start` maps that to exit code 1 so a supervisor
-  sees a failed processor as a failure.
+- **Exit status**: `start()` returns False when it declines to start (locked, or
+  the claude CLI is unreachable); `cmd_start` maps that to exit code 1 so a
+  supervisor sees a failed start as a failure.
 - **Running several profiles**: give each its own `--storage-dir`.
 
 ### Signal Handling
@@ -210,7 +269,7 @@ working_directory: .     # Execution CWD (resolved relative)
 context_files: []        # Files passed as @-references
 max_retries: 3           # Total attempts (1=no retry, -1=unlimited)
 estimated_tokens: null   # Optional hint
-model: null              # Optional Claude model ID (e.g. claude-haiku-4-5-20251001)
+model: null              # Optional Claude model ID
 # Internal fields (managed by the queue, not user-edited):
 status: queued
 retry_count: 0
@@ -219,6 +278,11 @@ last_executed: null
 rate_limited_at: null
 reset_time: null
 retry_not_before: null
+session_id: null         # persisted before launch; correlates retries and cleanup
+resume_existing_session: false # true only for resume-session jobs
+resume_message: null     # overrides the configured resume message
+claude_config_dir: null  # canonical absolute profile path
+usage_high_water: null   # cumulative usage already reported by this prompt
 ---
 ```
 
@@ -228,6 +292,8 @@ retry_not_before: null
 |---|---|---|
 | `start [--verbose] [--no-skip-permissions]` | Run queue loop | Yes |
 | `add <prompt> [-p priority] [-m model]` | Quick-add prompt | No |
+| `sessions [DIR] [--all] [--search t]` | List session ids and titles | No |
+| `resume-session [id] [-m msg]` | Queue a continuation of an existing session | No |
 | `template <name> [-p priority]` | Create template .md | No |
 | `status [--json] [--detailed]` | Queue stats | No |
 | `list [--status <s>] [--json]` | List prompts | No |

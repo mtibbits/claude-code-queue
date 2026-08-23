@@ -12,6 +12,7 @@ from claude_code_queue.models import (
     PromptStatus,
     QueuedPrompt,
     QueueState,
+    SessionStats,
 )
 from claude_code_queue.storage import MarkdownPromptParser, QueueStorage
 
@@ -1033,3 +1034,56 @@ def test_parse_optional_datetime_date_object():  # STO-042
     result = QueueStorage._parse_optional_datetime(date(2025, 6, 1))
     assert result == dt(2025, 6, 1, 0, 0, 0)
     assert result.tzinfo is None
+
+
+def test_yaml_profile_path_is_canonicalized_at_load(tmp_path, monkeypatch):  # STO-120
+    monkeypatch.chdir(tmp_path)
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(
+        MINIMAL_FRONTMATTER.replace(
+            "---\n\n", "claude_config_dir: profile/../profile\n---\n\n"
+        )
+        + "task",
+        encoding="utf-8",
+    )
+    prompt = MarkdownPromptParser.parse_prompt_file(prompt_file)
+    assert prompt is not None
+    assert prompt.claude_config_dir == str(tmp_path / "profile")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("session_id", "../../victim"),
+        ("session_id", "abcdefab-2222-3333-4444-555555555555".upper()),
+        ("claude_config_dir", "[]"),
+        ("resume_existing_session", "yes-please"),
+        ("usage_high_water", "[]"),
+        ("usage_high_water", "{input_tokens: -1}"),
+        ("usage_high_water", "{output_tokens: true}"),
+        ("usage_high_water", "{unknown: 1}"),
+    ],
+)
+def test_rejects_malformed_session_ownership_metadata(tmp_path, capsys, field, value):  # STO-121
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(
+        MINIMAL_FRONTMATTER.replace("---\n\n", f"{field}: {value}\n---\n\n")
+        + "task",
+        encoding="utf-8",
+    )
+    assert MarkdownPromptParser.parse_prompt_file(prompt_file) is None
+    assert "Error parsing prompt file" in capsys.readouterr().out
+
+
+def test_usage_high_water_survives_round_trip(storage):  # STO-122
+    expected = SessionStats(
+        input_tokens=1,
+        output_tokens=2,
+        cache_creation_input_tokens=3,
+        cache_read_input_tokens=4,
+        api_turns=5,
+    )
+    storage._save_single_prompt(
+        QueuedPrompt(id="abc12345", content="task", usage_high_water=expected)
+    )
+    assert storage.load_queue_state().prompts[0].usage_high_water == expected

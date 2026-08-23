@@ -37,7 +37,7 @@ Want me to queue it with `claude-queue` so it retries automatically?"
 claude-queue add "Fix the auth bug" --priority 1 --working-dir /path/to/project
 
 # Create a detailed template file (complex prompts with context)
-claude-queue template a1b2c3d4-task-name --priority 2
+claude-queue template task-name --priority 2
 
 # Check queue
 claude-queue status --detailed
@@ -48,12 +48,51 @@ claude-queue start
 
 # Cancel a queued prompt
 claude-queue cancel <prompt-id>
+
+# List sessions (ids + titles) for the current project
+claude-queue sessions
+
+# Continue THIS session later, when the usage limit resets
+claude-queue resume-session
 ```
+
+## Continuing a Rate-Limited Session
+
+When the current session hits the usage limit mid-task, suggest queuing its
+continuation rather than starting the work over later:
+
+```bash
+claude-queue resume-session                              # continues this session
+claude-queue resume-session -m "Finish the migration"    # with explicit instructions
+claude-queue resume-session <session-id>                 # some other session
+```
+
+To continue an *earlier* session, find its id first:
+
+```bash
+claude-queue sessions                    # this project, newest first
+claude-queue sessions ~/code/other       # some other project
+claude-queue sessions --all              # every project
+claude-queue sessions --search parser    # filter by title
+```
+
+Each row is a session id and the title Claude Code generated for it, so the id
+can be copied straight into `resume-session`.
+
+With no arguments it uses `$CLAUDE_CODE_SESSION_ID`, so it works from inside the
+session that hit the limit. At reset the queue reopens that conversation — the
+whole history is intact, so work already done is not repeated.
+
+The continuation runs non-interactively (`claude --print --resume`). Results land
+in `~/.claude-queue/completed/`, and the session stays reopenable with
+`claude --resume <session-id>` afterwards.
+
+Queued jobs get this automatically: an interrupted job resumes its own session on
+retry instead of restarting.
 
 ## Prompt Template Format
 
-Active queue files live at
-`~/.claude-queue/queue/a1b2c3d4-task-name.md`:
+Template files live at `~/.claude-queue/queue/task-name.md`:
 
 ```markdown
 ---
@@ -81,39 +120,22 @@ Background, constraints, or requirements.
 What should be delivered when done.
 ```
 
-### Filename convention
-
-Each active queue filename must start with a unique ID. Add a `-` and a
-descriptive name after the ID. The queue reads everything before the first
-`-` as the prompt ID.
-
-`claude-queue add`, `bank use`, and `batch generate` create an eight-character
-hexadecimal ID. If you create an active queue file directly or use
-`claude-queue template`, supply a unique ID in the filename.
-
-For a batch of active queue files that you write by hand, you can use unique,
-zero-padded numeric IDs that match the `priority` field. The file order from
-`ls` then matches the queue's priority order:
-
-```
-0001-Fix-auth-bug.md          # priority: 1, runs first
-0002-Add-logging.md           # priority: 2, runs second
-0003-Update-tests.md          # priority: 3, runs third
-```
-
-Use enough padding for the largest priority. Four digits cover priorities from
-`0` through `9999`.
-
 ### Frontmatter Fields
 
 | Field | Notes |
 |---|---|
-| `priority` | Lower number executes first (`0` is highest). For a hand-written ordered batch, you can match this value to the numeric filename ID. |
+| `priority` | **0 = highest**. Lower number executes first. |
 | `working_directory` | Absolute path. Use the actual project path from context. |
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
 | `estimated_tokens` | Optional hint; set `null` if unknown. |
-| `model` | Claude model ID (e.g. `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`). Omit or set `null` to use the default. |
+| `model` | Claude model ID. Omit or set `null` to use the configured default. |
+| `resume_message` | Sent when continuing an interrupted attempt. Omit to use the configured default. |
+| `claude_config_dir` | Claude Code profile to bill. Set automatically from `$CLAUDE_CONFIG_DIR` at queue time. |
+
+The queue persists `session_id` before launch. Do not set it by hand. The
+`resume-session` command also sets `resume_existing_session: true` so an older
+Claude CLI cannot silently run the continuation as a new task.
 
 ### Priority Guidelines
 
@@ -135,9 +157,9 @@ Use enough padding for the largest priority. Four digits cover priorities from
 - The user will want to review or edit before running
 
 For template files: construct the content and either run
-`claude-queue template a1b2c3d4-task-name` and show the user what to paste in, or
+`claude-queue template task-name` and show the user what to paste in, or
 write the YAML+markdown content directly and tell the user to save it to
-`~/.claude-queue/queue/a1b2c3d4-task-name.md`.
+`~/.claude-queue/queue/task-name.md`.
 
 ## Template Bank (Reusable Templates)
 
@@ -172,6 +194,7 @@ working_directory: /path/to/project
 context_files: []
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 Refactor `{{filename}}` located at `{{filepath}}`:
@@ -193,8 +216,17 @@ Refactor `{{filename}}` located at `{{filepath}}`:
 ## Key Behavior Notes
 
 **`--dangerously-skip-permissions`**: Passed to `claude` by default so the
-daemon runs unattended. To re-enable interactive permission prompts:
+daemon runs unattended. To disable interactive permission prompts:
 `claude-queue start --no-skip-permissions`.
+
+**Multiple accounts**: each Claude Code profile is a separate account and a
+separate usage limit. A prompt records the active profile when queued (override
+with `--profile DIR`), and one processor serves them all — when one account hits
+its limit, work billed to the others keeps running.
+
+**Resume message defaults**: set `resume_message` in the prompt, or
+`resume_message:` in `.claude-queue.yaml` in the project directory, or in
+`~/.claude-queue/config.yaml` queue-wide.
 
 **At-least-once semantics**: If the daemon crashes mid-execution, the task
 reruns on restart. Prompt users to design queued tasks to be idempotent
@@ -203,15 +235,3 @@ reruns on restart. Prompt users to design queued tasks to be idempotent
 
 **Always suggest** running `claude-queue status --detailed` before starting
 the daemon so the user can review what will execute.
-
-## Recommended shell aliases
-
-If `watch` is installed, add these aliases to `~/.bashrc` or `~/.zshrc`:
-
-```bash
-alias wQueue='watch ls "$HOME/.claude-queue/queue"'
-alias wqStat='watch claude-queue status --detailed'
-```
-
-`wQueue` shows files as the daemon moves them. `wqStat` shows queue status,
-including the current jobs and their retry counts.
