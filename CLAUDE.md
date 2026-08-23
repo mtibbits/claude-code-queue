@@ -235,5 +235,6 @@ retry_not_before: null
 | `test` | Verify claude CLI | Yes |
 | `bank save/list/use/delete` | Template bank ops | No |
 | `batch generate/validate/variables` | Batch job generation | No |
+| `cleanup [--dry-run]` | Remove rate-limit artifacts from the active Claude profile | No |
 | `install-skill [--force]` | Copy SKILL.md to ~/.claude/skills/ | No |
 | `prompt-box` | Launch Rust TUI | No (needs Rust binary) |
