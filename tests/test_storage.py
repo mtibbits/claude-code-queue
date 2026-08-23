@@ -414,7 +414,9 @@ def test_parse_model_null(tmp_path):  # STO-066
     assert prompt.model is None
 
 
-@pytest.mark.parametrize("value", ["true", "42", "[]", "{}", "''"])
+@pytest.mark.parametrize(
+    "value", ["true", "42", "[]", "{}", "''", "'--dangerously-skip-permissions'"]
+)
 def test_parse_model_rejects_invalid_yaml_values(tmp_path, value):  # STO-067
     """Invalid YAML model values do not create executable prompts."""
     storage = QueueStorage(str(tmp_path))
@@ -492,6 +494,14 @@ def test_bank_list_skips_template_with_invalid_model(tmp_path):
     storage = QueueStorage(str(tmp_path))
     (storage.bank_dir / "invalid.md").write_text(
         "---\nmodel: true\n---\n\nInvalid model"
+    )
+    assert storage.list_bank_templates() == []
+
+
+def test_bank_list_skips_template_with_option_like_model(tmp_path):
+    storage = QueueStorage(str(tmp_path))
+    (storage.bank_dir / "invalid.md").write_text(
+        "---\nmodel: --dangerously-skip-permissions\n---\n\nInvalid model"
     )
     assert storage.list_bank_templates() == []
 

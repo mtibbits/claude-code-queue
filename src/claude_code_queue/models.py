@@ -18,6 +18,8 @@ def parse_optional_model(value: Any) -> Optional[str]:
     model = value.strip()
     if not model:
         raise ValueError("model must be a non-empty string or null")
+    if model.startswith("-"):
+        raise ValueError("model must not start with '-'")
     return model
 
 

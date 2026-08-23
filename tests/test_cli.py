@@ -256,6 +256,11 @@ class TestAddCommand:
             self._run_add("--model", model)
         assert exc_info.value.code == 2
 
+    def test_add_rejects_option_like_model(self):
+        with pytest.raises(SystemExit) as exc_info:
+            self._run_add("--model=--dangerously-skip-permissions")
+        assert exc_info.value.code == 2
+
     def test_add_default_model_none(self):
         _, storage = self._run_add()
         prompt = storage._save_single_prompt.call_args[0][0]

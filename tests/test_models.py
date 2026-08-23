@@ -67,9 +67,11 @@ def test_prompt_model_accepts_string():  # MOD-030
     assert p.model == "claude-haiku-4-5-20251001"
 
 
-@pytest.mark.parametrize("value", [True, 42, [], {}, "", "   "])
+@pytest.mark.parametrize(
+    "value", [True, 42, [], {}, "", "   ", "--dangerously-skip-permissions", "  -p"]
+)
 def test_parse_optional_model_rejects_invalid_values(value):
-    with pytest.raises(ValueError, match="non-empty string or null"):
+    with pytest.raises(ValueError, match="model must"):
         parse_optional_model(value)
 
 
